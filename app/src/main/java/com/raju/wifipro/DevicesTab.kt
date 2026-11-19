@@ -35,6 +35,11 @@ import java.net.Socket
 
 data class LanDevice(val ip: String, val name: String, val tag: String)
 
+private val COMMON_PORTS = intArrayOf(
+    80, 443, 554, 8080, 8443, 5353, 62078,
+    22, 23, 135, 139, 445, 5000, 7000, 9100, 32400
+)
+
 @Composable
 fun DevicesTab() {
     val context = LocalContext.current
@@ -62,7 +67,7 @@ fun DevicesTab() {
             val gatewayIp = detectGatewayIp(context)
             val subnet = myIp.substringBeforeLast(".", "192.168.8")
             val foundMap = mutableMapOf<String, LanDevice>()
-            val semaphore = Semaphore(48)
+            val semaphore = Semaphore(64)
             var done = 0
 
             withContext(Dispatchers.IO) {
@@ -72,20 +77,15 @@ fun DevicesTab() {
                             val ip = "$subnet.$host"
                             val reachable = checkHostReachable(ip)
                             if (reachable || ip == myIp || ip == gatewayIp) {
-                                val hostName = try {
-                                    val h = InetAddress.getByName(ip).canonicalHostName
-                                    if (h == ip) "Network Device" else h
-                                } catch (_: Exception) { "Network Device" }
-
+                                val hostName = resolveFriendlyName(ip)
                                 val tag = when (ip) {
                                     gatewayIp -> "Router / Gateway"
                                     myIp -> "This Phone"
                                     else -> "Active Device"
                                 }
                                 val defaultName = if (tag != "Active Device") tag else hostName
-                                val finalName = getSavedOrDefaultName(ip, defaultName)
                                 synchronized(foundMap) {
-                                    foundMap[ip] = LanDevice(ip, finalName, tag)
+                                    foundMap[ip] = LanDevice(ip, getSavedOrDefaultName(ip, defaultName), tag)
                                 }
                             }
                             done++
@@ -102,7 +102,6 @@ fun DevicesTab() {
                 }
                 jobs.awaitAll()
 
-                // Also merge entries present in kernel ARP table on this subnet
                 readArpIps(subnet).forEach { ip ->
                     synchronized(foundMap) {
                         if (!foundMap.containsKey(ip)) {
@@ -111,11 +110,7 @@ fun DevicesTab() {
                                 myIp -> "This Phone"
                                 else -> "Active Device"
                             }
-                            val hostName = try {
-                                val h = InetAddress.getByName(ip).canonicalHostName
-                                if (h == ip) "Network Device" else h
-                            } catch (_: Exception) { "Network Device" }
-                            val defaultName = if (tag != "Active Device") tag else hostName
+                            val defaultName = if (tag != "Active Device") tag else resolveFriendlyName(ip)
                             foundMap[ip] = LanDevice(ip, getSavedOrDefaultName(ip, defaultName), tag)
                         }
                     }
@@ -233,14 +228,23 @@ fun DevicesTab() {
     }
 }
 
+private fun resolveFriendlyName(ip: String): String {
+    return try {
+        val h = InetAddress.getByName(ip).canonicalHostName
+        if (h.isNullOrBlank() || h == ip) "Network Device" else h.substringBefore(".local").substringBefore(".lan")
+    } catch (_: Exception) {
+        "Network Device"
+    }
+}
+
 private fun checkHostReachable(ip: String): Boolean {
     try {
-        if (InetAddress.getByName(ip).isReachable(300)) return true
+        if (InetAddress.getByName(ip).isReachable(350)) return true
     } catch (_: Exception) {}
-    for (port in intArrayOf(80, 443, 554, 8080, 5353, 62078)) {
+    for (port in COMMON_PORTS) {
         try {
             Socket().use { s ->
-                s.connect(InetSocketAddress(ip, port), 130)
+                s.connect(InetSocketAddress(ip, port), 140)
                 return true
             }
         } catch (_: Exception) {}
@@ -255,9 +259,8 @@ private fun readArpIps(subnet: String): List<String> {
         f.readLines().drop(1).mapNotNull { line ->
             val parts = line.trim().split(Regex("\\s+"))
             val ip = parts.getOrNull(0) ?: return@mapNotNull null
-            val flags = parts.getOrNull(2) ?: ""
-            // 0x2 means complete/reachable ARP entry
-            if (ip.startsWith("$subnet.") && flags != "0x0") ip else null
+            val mac = parts.getOrNull(3) ?: ""
+            if (ip.startsWith("$subnet.") && mac.isNotBlank() && mac != "00:00:00:00:00:00") ip else null
         }
     } catch (_: Exception) {
         emptyList()
