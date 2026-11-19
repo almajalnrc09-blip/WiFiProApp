@@ -44,7 +44,6 @@ fun SignalTab() {
     var wifiStandard by remember { mutableStateOf("Unknown") }
     var channelNum by remember { mutableIntStateOf(0) }
     var bandLabel by remember { mutableStateOf("--") }
-    var selectedBand by remember { mutableStateOf("2.4 GHz") }
     var scanStatus by remember { mutableStateOf("Live") }
     val rssiHistory = remember { mutableStateListOf<Int>() }
     var scanList by remember { mutableStateOf<List<ScanResult>>(emptyList()) }
@@ -99,9 +98,6 @@ fun SignalTab() {
                     freq in 5000..5900 -> "5 GHz"
                     freq >= 5925 -> "6 GHz"
                     else -> "--"
-                }
-                if (seconds == 0 && (bandLabel == "2.4 GHz" || bandLabel == "5 GHz")) {
-                    selectedBand = bandLabel
                 }
                 wifiStandard = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     when (info.wifiStandard) {
@@ -158,6 +154,7 @@ fun SignalTab() {
             }
         }
 
+        // 1. Connected Wi-Fi Summary Card
         Card(colors = CardDefaults.cardColors(containerColor = CardDark), shape = RoundedCornerShape(16.dp)) {
             Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -180,6 +177,23 @@ fun SignalTab() {
             }
         }
 
+        // 2. Separate 5 GHz Channel Map
+        ChannelMapCard(
+            title = "5 GHz Channel Map",
+            is5G = true,
+            scanList = scanList,
+            currentSsid = ssid
+        )
+
+        // 3. Separate 2.4 GHz Channel Map (Ch 1-11)
+        ChannelMapCard(
+            title = "2.4 GHz Channel Map (Ch 1-11)",
+            is5G = false,
+            scanList = scanList,
+            currentSsid = ssid
+        )
+
+        // 4. Live Signal Graph (at the bottom)
         Card(colors = CardDefaults.cardColors(containerColor = CardDark), shape = RoundedCornerShape(16.dp)) {
             Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                 Text("Live Signal Graph (1s refresh)", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
@@ -203,82 +217,77 @@ fun SignalTab() {
                 }
             }
         }
+    }
+}
 
-        Card(colors = CardDefaults.cardColors(containerColor = CardDark), shape = RoundedCornerShape(16.dp)) {
-            Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Text("Channel Map", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(
-                            selected = selectedBand == "2.4 GHz",
-                            onClick = { selectedBand = "2.4 GHz" },
-                            label = { Text("2.4 GHz (1-11)") }
-                        )
-                        FilterChip(
-                            selected = selectedBand == "5 GHz",
-                            onClick = { selectedBand = "5 GHz" },
-                            label = { Text("5 GHz") }
-                        )
+@Suppress("DEPRECATION")
+@Composable
+private fun ChannelMapCard(
+    title: String,
+    is5G: Boolean,
+    scanList: List<ScanResult>,
+    currentSsid: String
+) {
+    val filtered = scanList.filter {
+        if (is5G) it.frequency in 5000..5900 else it.frequency in 2400..2500
+    }
+    val channels5G = listOf(36, 40, 44, 48, 52, 56, 60, 64, 100, 108, 116, 132, 149, 153, 157, 161, 165)
+
+    Card(colors = CardDefaults.cardColors(containerColor = CardDark), shape = RoundedCornerShape(16.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            Text(title, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+            Spacer(Modifier.height(10.dp))
+
+            Canvas(modifier = Modifier.fillMaxWidth().height(135.dp)) {
+                val w = size.width
+                val h = size.height
+                drawLine(Color(0xFF475569), Offset(0f, h - 2f), Offset(w, h - 2f), strokeWidth = 2f)
+
+                val palette = listOf(AccentCyan, AccentGreen, AccentAmber, Color(0xFFA855F7), Color(0xFFEC4899))
+                filtered.take(10).forEachIndexed { idx, net ->
+                    val ch = freqToChannel(net.frequency)
+                    val centerFrac = if (!is5G) {
+                        ((ch.coerceIn(1, 13) - 1) / 11f).coerceIn(0.05f, 0.95f)
+                    } else {
+                        val pos = channels5G.indexOf(ch).let { if (it >= 0) it else 0 }
+                        ((pos + 1).toFloat() / (channels5G.size + 1)).coerceIn(0.05f, 0.95f)
                     }
-                }
-                Spacer(Modifier.height(10.dp))
+                    val cx = w * centerFrac
+                    val spread = if (!is5G) w * 0.14f else w * 0.06f
+                    val peakNorm = ((net.level.coerceIn(-100, -30) + 100) / 70f)
+                    val peakY = h - (peakNorm * (h - 14f))
+                    val isCurrent = net.SSID == currentSsid
+                    val color = if (isCurrent) AccentGreen else palette[idx % palette.size]
 
-                val filtered = scanList.filter {
-                    if (selectedBand == "2.4 GHz") it.frequency in 2400..2500 else it.frequency in 5000..5900
-                }
-                val channels5G = listOf(36, 40, 44, 48, 52, 56, 60, 64, 100, 108, 116, 132, 149, 153, 157, 161, 165)
-
-                Canvas(modifier = Modifier.fillMaxWidth().height(150.dp)) {
-                    val w = size.width
-                    val h = size.height
-                    drawLine(Color(0xFF475569), Offset(0f, h - 2f), Offset(w, h - 2f), strokeWidth = 2f)
-
-                    val palette = listOf(AccentCyan, AccentGreen, AccentAmber, Color(0xFFA855F7), Color(0xFFEC4899))
-                    filtered.take(10).forEachIndexed { idx, net ->
-                        val ch = freqToChannel(net.frequency)
-                        val centerFrac = if (selectedBand == "2.4 GHz") {
-                            ((ch.coerceIn(1, 13) - 1) / 11f).coerceIn(0.05f, 0.95f)
-                        } else {
-                            val pos = channels5G.indexOf(ch).let { if (it >= 0) it else 0 }
-                            ((pos + 1).toFloat() / (channels5G.size + 1)).coerceIn(0.05f, 0.95f)
-                        }
-                        val cx = w * centerFrac
-                        val spread = if (selectedBand == "2.4 GHz") w * 0.14f else w * 0.06f
-                        val peakNorm = ((net.level.coerceIn(-100, -30) + 100) / 70f)
-                        val peakY = h - (peakNorm * (h - 14f))
-                        val isCurrent = net.SSID == ssid
-                        val color = if (isCurrent) AccentGreen else palette[idx % palette.size]
-
-                        val p = Path().apply {
-                            moveTo((cx - spread).coerceAtLeast(0f), h)
-                            quadraticBezierTo(cx, peakY - (h - peakY) * 0.4f, (cx + spread).coerceAtMost(w), h)
-                        }
-                        drawPath(p, color = color.copy(alpha = if (isCurrent) 0.35f else 0.15f))
-                        drawPath(p, color = color, style = Stroke(width = if (isCurrent) 5f else 3f))
+                    val p = Path().apply {
+                        moveTo((cx - spread).coerceAtLeast(0f), h)
+                        quadraticBezierTo(cx, peakY - (h - peakY) * 0.4f, (cx + spread).coerceAtMost(w), h)
                     }
+                    drawPath(p, color = color.copy(alpha = if (isCurrent) 0.35f else 0.15f))
+                    drawPath(p, color = color, style = Stroke(width = if (isCurrent) 5f else 3f))
                 }
+            }
 
-                Spacer(Modifier.height(6.dp))
-                val labelRow = if (selectedBand == "2.4 GHz") "Ch: 1   2   3   4   5   6   7   8   9   10   11"
-                else "5 GHz Channels: 36, 40, 44, 48 ... 149, 153, 157, 161, 165"
-                Text(labelRow, fontSize = 11.sp, color = TextSecondary)
-                Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
+            val labelRow = if (!is5G) "Ch: 1   2   3   4   5   6   7   8   9   10   11"
+            else "5 GHz Channels: 36, 40, 44, 48 ... 149, 153, 157, 161, 165"
+            Text(labelRow, fontSize = 11.sp, color = TextSecondary)
+            Spacer(Modifier.height(8.dp))
 
-                if (filtered.isEmpty()) {
-                    Text("Turn on Location/GPS & tap Refresh to see nearby networks.", fontSize = 12.sp, color = AccentAmber)
-                } else {
-                    filtered.sortedByDescending { it.level }.take(8).forEach { net ->
-                        val ch = freqToChannel(net.frequency)
-                        val isMine = net.SSID == ssid
-                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(
-                                text = (if (net.SSID.isNullOrBlank()) "<Hidden>" else net.SSID) + if (isMine) " (Connected)" else "",
-                                fontSize = 13.sp,
-                                color = if (isMine) AccentGreen else TextPrimary,
-                                fontWeight = if (isMine) FontWeight.Bold else FontWeight.Normal
-                            )
-                            Text("Ch $ch  |  ${net.level} dBm", fontSize = 12.sp, color = TextSecondary)
-                        }
+            if (filtered.isEmpty()) {
+                Text("No ${if (is5G) "5 GHz" else "2.4 GHz"} networks found (check Location/GPS).", fontSize = 12.sp, color = AccentAmber)
+            } else {
+                filtered.sortedByDescending { it.level }.take(8).forEach { net ->
+                    val ch = freqToChannel(net.frequency)
+                    val isMine = net.SSID == currentSsid
+                    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(
+                            text = (if (net.SSID.isNullOrBlank()) "<Hidden>" else net.SSID) + if (isMine) " (Connected)" else "",
+                            fontSize = 13.sp,
+                            color = if (isMine) AccentGreen else TextPrimary,
+                            fontWeight = if (isMine) FontWeight.Bold else FontWeight.Normal
+                        )
+                        Text("Ch $ch  |  ${net.level} dBm", fontSize = 12.sp, color = TextSecondary)
                     }
                 }
             }
