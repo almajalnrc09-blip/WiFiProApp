@@ -31,6 +31,14 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import kotlinx.coroutines.delay
 
+private data class CachedNet(
+    val ssid: String,
+    val bssid: String,
+    val freq: Int,
+    val level: Int,
+    val seenAtMs: Long
+)
+
 @Suppress("DEPRECATION")
 @Composable
 fun SignalTab() {
@@ -46,14 +54,28 @@ fun SignalTab() {
     var bandLabel by remember { mutableStateOf("--") }
     var scanStatus by remember { mutableStateOf("Live") }
     val rssiHistory = remember { mutableStateListOf<Int>() }
-    var scanList by remember { mutableStateOf<List<ScanResult>>(emptyList()) }
+    val recentMap = remember { mutableStateMapOf<String, CachedNet>() }
+    var netList by remember { mutableStateOf<List<CachedNet>>(emptyList()) }
+
+    fun mergeScanResults(results: List<ScanResult>) {
+        val now = System.currentTimeMillis()
+        results.forEach { sr ->
+            val key = sr.BSSID ?: "${sr.SSID}_${sr.frequency}"
+            val name = if (sr.SSID.isNullOrBlank()) "<Hidden>" else sr.SSID
+            recentMap[key] = CachedNet(name, key, sr.frequency, sr.level, now)
+        }
+        // Keep networks seen within last 25 seconds so momentary scan misses don't flicker
+        val staleKeys = recentMap.filterValues { now - it.seenAtMs > 25_000L }.keys
+        staleKeys.forEach { recentMap.remove(it) }
+        netList = recentMap.values.toList()
+    }
 
     fun triggerScan() {
         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
             try {
                 val started = wifiManager.startScan()
-                scanStatus = if (started) "Scanning..." else "Live (Cached)"
-                scanList = wifiManager.scanResults ?: emptyList()
+                scanStatus = if (started) "Scanning..." else "Live"
+                mergeScanResults(wifiManager.scanResults ?: emptyList())
             } catch (_: Exception) {
                 scanStatus = "Live"
             }
@@ -65,7 +87,7 @@ fun SignalTab() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
                 if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
                     try {
-                        scanList = wifiManager.scanResults ?: emptyList()
+                        mergeScanResults(wifiManager.scanResults ?: emptyList())
                         scanStatus = "Updated"
                     } catch (_: Exception) {}
                 }
@@ -115,7 +137,7 @@ fun SignalTab() {
                 if (rssiHistory.size > 30) rssiHistory.removeAt(0)
             }
 
-            if (seconds > 0 && seconds % 15 == 0) {
+            if (seconds > 0 && seconds % 10 == 0) {
                 triggerScan()
             }
             seconds++
@@ -154,7 +176,6 @@ fun SignalTab() {
             }
         }
 
-        // 1. Connected Wi-Fi Summary Card
         Card(colors = CardDefaults.cardColors(containerColor = CardDark), shape = RoundedCornerShape(16.dp)) {
             Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -177,23 +198,20 @@ fun SignalTab() {
             }
         }
 
-        // 2. Separate 5 GHz Channel Map
         ChannelMapCard(
             title = "5 GHz Channel Map",
             is5G = true,
-            scanList = scanList,
+            netList = netList,
             currentSsid = ssid
         )
 
-        // 3. Separate 2.4 GHz Channel Map (Ch 1-11)
         ChannelMapCard(
             title = "2.4 GHz Channel Map (Ch 1-11)",
             is5G = false,
-            scanList = scanList,
+            netList = netList,
             currentSsid = ssid
         )
 
-        // 4. Live Signal Graph (at the bottom)
         Card(colors = CardDefaults.cardColors(containerColor = CardDark), shape = RoundedCornerShape(16.dp)) {
             Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                 Text("Live Signal Graph (1s refresh)", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = TextPrimary)
@@ -220,16 +238,15 @@ fun SignalTab() {
     }
 }
 
-@Suppress("DEPRECATION")
 @Composable
 private fun ChannelMapCard(
     title: String,
     is5G: Boolean,
-    scanList: List<ScanResult>,
+    netList: List<CachedNet>,
     currentSsid: String
 ) {
-    val filtered = scanList.filter {
-        if (is5G) it.frequency in 5000..5900 else it.frequency in 2400..2500
+    val filtered = netList.filter {
+        if (is5G) it.freq in 5000..5900 else it.freq in 2400..2500
     }
     val channels5G = listOf(36, 40, 44, 48, 52, 56, 60, 64, 100, 108, 116, 132, 149, 153, 157, 161, 165)
 
@@ -244,8 +261,8 @@ private fun ChannelMapCard(
                 drawLine(Color(0xFF475569), Offset(0f, h - 2f), Offset(w, h - 2f), strokeWidth = 2f)
 
                 val palette = listOf(AccentCyan, AccentGreen, AccentAmber, Color(0xFFA855F7), Color(0xFFEC4899))
-                filtered.take(10).forEachIndexed { idx, net ->
-                    val ch = freqToChannel(net.frequency)
+                filtered.sortedByDescending { it.level }.take(12).forEachIndexed { idx, net ->
+                    val ch = freqToChannel(net.freq)
                     val centerFrac = if (!is5G) {
                         ((ch.coerceIn(1, 13) - 1) / 11f).coerceIn(0.05f, 0.95f)
                     } else {
@@ -256,7 +273,7 @@ private fun ChannelMapCard(
                     val spread = if (!is5G) w * 0.14f else w * 0.06f
                     val peakNorm = ((net.level.coerceIn(-100, -30) + 100) / 70f)
                     val peakY = h - (peakNorm * (h - 14f))
-                    val isCurrent = net.SSID == currentSsid
+                    val isCurrent = net.ssid == currentSsid
                     val color = if (isCurrent) AccentGreen else palette[idx % palette.size]
 
                     val p = Path().apply {
@@ -278,11 +295,11 @@ private fun ChannelMapCard(
                 Text("No ${if (is5G) "5 GHz" else "2.4 GHz"} networks found (check Location/GPS).", fontSize = 12.sp, color = AccentAmber)
             } else {
                 filtered.sortedByDescending { it.level }.take(8).forEach { net ->
-                    val ch = freqToChannel(net.frequency)
-                    val isMine = net.SSID == currentSsid
+                    val ch = freqToChannel(net.freq)
+                    val isMine = net.ssid == currentSsid
                     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(
-                            text = (if (net.SSID.isNullOrBlank()) "<Hidden>" else net.SSID) + if (isMine) " (Connected)" else "",
+                            text = net.ssid + if (isMine) " (Connected)" else "",
                             fontSize = 13.sp,
                             color = if (isMine) AccentGreen else TextPrimary,
                             fontWeight = if (isMine) FontWeight.Bold else FontWeight.Normal
