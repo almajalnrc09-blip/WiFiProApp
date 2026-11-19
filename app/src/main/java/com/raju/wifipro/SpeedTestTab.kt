@@ -23,6 +23,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
 
+private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
+
 @Composable
 fun SpeedTestTab() {
     val scope = rememberCoroutineScope()
@@ -101,12 +103,16 @@ fun SpeedTestTab() {
                         downloadMbps = measureDownload { live -> currentMbps = live }
 
                         phase = "Testing Upload..."
-                        uploadMbps = measureUpload { live -> currentMbps = live }
+                        uploadMbps = try {
+                            measureUpload { live -> currentMbps = live }
+                        } catch (_: Exception) {
+                            0.0
+                        }
 
                         currentMbps = downloadMbps
                         phase = "Test Completed"
                     } catch (e: Exception) {
-                        phase = "Error: Check Internet"
+                        phase = "Error: ${e.message?.take(28) ?: "Check Internet"}"
                     } finally {
                         isTesting = false
                     }
@@ -136,73 +142,99 @@ private fun SpeedStatCard(title: String, value: String, modifier: Modifier) {
 }
 
 private suspend fun measurePing(): Long = withContext(Dispatchers.IO) {
-    var total = 0L
-    val count = 3
-    repeat(count) {
+    var best = Long.MAX_VALUE
+    repeat(3) {
         val start = System.currentTimeMillis()
-        val conn = URL("https://1.1.1.1/cdn-cgi/trace").openConnection() as HttpURLConnection
-        conn.connectTimeout = 4000
-        conn.readTimeout = 4000
-        conn.requestMethod = "HEAD"
+        val conn = URL("https://www.google.com/generate_204").openConnection() as HttpURLConnection
+        conn.connectTimeout = 5000
+        conn.readTimeout = 5000
+        conn.setRequestProperty("User-Agent", UA)
+        conn.requestMethod = "GET"
         conn.connect()
         conn.responseCode
         conn.disconnect()
-        total += (System.currentTimeMillis() - start)
+        val elapsed = System.currentTimeMillis() - start
+        if (elapsed < best) best = elapsed
     }
-    total / count
+    if (best == Long.MAX_VALUE) 0L else best
 }
 
 private suspend fun measureDownload(onLive: (Double) -> Unit): Double = withContext(Dispatchers.IO) {
-    val conn = URL("https://speed.cloudflare.com/__down?bytes=15000000").openConnection() as HttpURLConnection
-    conn.connectTimeout = 8000
-    conn.readTimeout = 10000
-    val stream = conn.inputStream
-    val buffer = ByteArray(16384)
-    var totalBytes = 0L
-    val startTime = System.nanoTime()
-    var lastUpdate = startTime
-    while (true) {
-        val read = stream.read(buffer)
-        if (read == -1) break
-        totalBytes += read
-        val now = System.nanoTime()
-        val elapsedSec = (now - startTime) / 1_000_000_000.0
-        if ((now - lastUpdate) > 200_000_000L && elapsedSec > 0.1) {
-            val mbps = (totalBytes * 8.0) / (elapsedSec * 1_000_000.0)
-            withContext(Dispatchers.Main) { onLive(mbps) }
-            lastUpdate = now
+    val urls = listOf(
+        "https://speed.cloudflare.com/__down?bytes=15000000",
+        "https://proof.ovh.net/files/10Mb.dat"
+    )
+    var lastError: Exception? = null
+    for (urlStr in urls) {
+        try {
+            val conn = URL(urlStr).openConnection() as HttpURLConnection
+            conn.connectTimeout = 8000
+            conn.readTimeout = 10000
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("User-Agent", UA)
+            conn.setRequestProperty("Accept", "*/*")
+            conn.setRequestProperty("Cache-Control", "no-cache")
+            if (conn.responseCode !in 200..299) {
+                conn.disconnect()
+                continue
+            }
+            val stream = conn.inputStream
+            val buffer = ByteArray(16384)
+            var totalBytes = 0L
+            val startTime = System.nanoTime()
+            var lastUpdate = startTime
+            while (true) {
+                val read = stream.read(buffer)
+                if (read == -1) break
+                totalBytes += read
+                val now = System.nanoTime()
+                val elapsedSec = (now - startTime) / 1_000_000_000.0
+                if ((now - lastUpdate) > 180_000_000L && elapsedSec > 0.15) {
+                    val mbps = (totalBytes * 8.0) / (elapsedSec * 1_000_000.0)
+                    withContext(Dispatchers.Main) { onLive(mbps) }
+                    lastUpdate = now
+                }
+                if (elapsedSec > 6.0) break
+            }
+            stream.close()
+            conn.disconnect()
+            val totalSec = ((System.nanoTime() - startTime) / 1_000_000_000.0).coerceAtLeast(0.1)
+            return@withContext (totalBytes * 8.0) / (totalSec * 1_000_000.0)
+        } catch (e: Exception) {
+            lastError = e
         }
-        if (elapsedSec > 6.5) break
     }
-    stream.close()
-    conn.disconnect()
-    val totalSec = ((System.nanoTime() - startTime) / 1_000_000_000.0).coerceAtLeast(0.1)
-    (totalBytes * 8.0) / (totalSec * 1_000_000.0)
+    throw lastError ?: Exception("Download failed")
 }
 
 private suspend fun measureUpload(onLive: (Double) -> Unit): Double = withContext(Dispatchers.IO) {
+    val totalToSend = 2_500_000 // 2.5 MB fixed length
     val conn = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
     conn.connectTimeout = 8000
-    conn.readTimeout = 10000
+    conn.readTimeout = 12000
     conn.requestMethod = "POST"
     conn.doOutput = true
-    conn.setChunkedStreamingMode(16384)
-    val chunk = ByteArray(16384) { 0x55 }
+    conn.setRequestProperty("User-Agent", UA)
+    conn.setRequestProperty("Content-Type", "application/octet-stream")
+    conn.setFixedLengthStreamingMode(totalToSend)
+
+    val chunk = ByteArray(16384) { 0x41 }
     val out = conn.outputStream
-    var totalBytes = 0L
+    var totalBytes = 0
     val startTime = System.nanoTime()
     var lastUpdate = startTime
-    while (totalBytes < 3_500_000L) {
-        out.write(chunk)
-        totalBytes += chunk.size
+
+    while (totalBytes < totalToSend) {
+        val toWrite = minOf(chunk.size, totalToSend - totalBytes)
+        out.write(chunk, 0, toWrite)
+        totalBytes += toWrite
         val now = System.nanoTime()
         val elapsedSec = (now - startTime) / 1_000_000_000.0
-        if ((now - lastUpdate) > 200_000_000L && elapsedSec > 0.1) {
+        if ((now - lastUpdate) > 180_000_000L && elapsedSec > 0.15) {
             val mbps = (totalBytes * 8.0) / (elapsedSec * 1_000_000.0)
             withContext(Dispatchers.Main) { onLive(mbps) }
             lastUpdate = now
         }
-        if (elapsedSec > 5.0) break
     }
     out.flush()
     out.close()
