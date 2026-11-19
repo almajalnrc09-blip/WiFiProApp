@@ -7,6 +7,7 @@ import android.net.ConnectivityManager
 import android.net.http.SslError
 import android.net.wifi.WifiManager
 import android.webkit.CookieManager
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.SafeBrowsingResponse
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
@@ -240,12 +241,33 @@ fun RouterTab() {
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
                     colors = CardDefaults.cardColors(containerColor = CardDark)
                 ) {
-                    Text(
-                        text = pageErrorText ?: "",
-                        color = AccentAmber,
-                        fontSize = 12.sp,
-                        modifier = Modifier.padding(10.dp)
-                    )
+                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = pageErrorText ?: "",
+                            color = AccentAmber,
+                            fontSize = 12.sp
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextButton(
+                                onClick = {
+                                    val hostOnly = urlText.removePrefix("http://").removePrefix("https://").substringBefore("/")
+                                    navigateToUrl("https://$hostOnly")
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                            ) {
+                                Text("Try HTTPS", color = AccentCyan, fontSize = 12.sp)
+                            }
+                            TextButton(
+                                onClick = {
+                                    val hostOnly = urlText.removePrefix("http://").removePrefix("https://").substringBefore("/")
+                                    navigateToUrl("http://$hostOnly")
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                            ) {
+                                Text("Try Root HTTP", color = AccentGreen, fontSize = 12.sp)
+                            }
+                        }
+                    }
                 }
             }
 
@@ -289,6 +311,15 @@ fun RouterTab() {
                                 super.onPageFinished(view, url)
                                 isPageLoading = false
                                 if (!url.isNullOrBlank()) urlText = url
+                                // Check if page rendered blank body after load
+                                view?.evaluateJavascript(
+                                    "(function(){ return document.body ? document.body.innerText.trim().length : 0; })()"
+                                ) { lenStr ->
+                                    val textLen = lenStr?.trim()?.toIntOrNull() ?: -1
+                                    if (textLen == 0) {
+                                        pageErrorText = "Router page loaded empty/blank on $url (TP-Link web UI may require Chrome/AP reachability)."
+                                    }
+                                }
                                 val u = pendingUser
                                 val p = pendingPass
                                 if (!p.isNullOrEmpty()) {
@@ -321,7 +352,6 @@ fun RouterTab() {
                             ) {
                                 if (request?.isForMainFrame == true) {
                                     val failedUrl = request.url?.toString() ?: ""
-                                    // If http failed on local router IP, retry once with https
                                     if (failedUrl.startsWith("http://")) {
                                         val httpsUrl = failedUrl.replaceFirst("http://", "https://")
                                         urlText = httpsUrl
@@ -331,6 +361,12 @@ fun RouterTab() {
                                     isPageLoading = false
                                     pageErrorText = "Load issue on $failedUrl (${error?.description ?: "Connection failed"})"
                                 }
+                            }
+
+                            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                                isPageLoading = false
+                                pageErrorText = "WebView renderer stopped. Tap Try HTTPS or Reload."
+                                return true
                             }
                         }
                         webChromeClient = WebChromeClient()
