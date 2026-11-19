@@ -26,22 +26,99 @@ import androidx.compose.ui.viewinterop.AndroidView
 import org.json.JSONObject
 import java.net.Inet4Address
 
+private data class RouterProfile(
+    val slotId: String,
+    val label: String,
+    val username: String,
+    val password: String
+)
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun RouterTab() {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("router_vault", Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences("router_profiles_v2", Context.MODE_PRIVATE) }
     val detectedGateway = remember { detectGatewayIp(context) }
 
     var urlText by remember { mutableStateOf("http://$detectedGateway") }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var showVaultDialog by remember { mutableStateOf(false) }
 
-    val savedJson = remember(detectedGateway, showVaultDialog) {
-        prefs.getString(detectedGateway, null)?.let { JSONObject(it) }
+    fun loadProfiles(): List<RouterProfile> {
+        val defaults = listOf(
+            "slot_1" to "TP-Link",
+            "slot_2" to "Huawei",
+            "slot_3" to "Tenda"
+        )
+        return defaults.map { (id, defLabel) ->
+            val raw = prefs.getString(id, null)
+            if (raw != null) {
+                val obj = JSONObject(raw)
+                RouterProfile(
+                    slotId = id,
+                    label = obj.optString("label", defLabel).ifBlank { defLabel },
+                    username = obj.optString("user", "admin"),
+                    password = obj.optString("pass", "")
+                )
+            } else {
+                RouterProfile(id, defLabel, "admin", "")
+            }
+        }
     }
-    var username by remember(savedJson) { mutableStateOf(savedJson?.optString("user", "admin") ?: "admin") }
-    var password by remember(savedJson) { mutableStateOf(savedJson?.optString("pass", "") ?: "") }
+
+    var profiles by remember { mutableStateOf(loadProfiles()) }
+    var selectedIdx by remember { mutableIntStateOf(0) }
+
+    val activeProfile = profiles[selectedIdx]
+    var editLabel by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeProfile.label) }
+    var editUser by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeProfile.username) }
+    var editPass by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeProfile.password) }
+
+    fun saveCurrentProfile(): RouterProfile {
+        val finalLabel = editLabel.trim().ifBlank { activeProfile.label }
+        val obj = JSONObject()
+            .put("label", finalLabel)
+            .put("user", editUser)
+            .put("pass", editPass)
+        prefs.edit().putString(activeProfile.slotId, obj.toString()).apply()
+        val updated = RouterProfile(activeProfile.slotId, finalLabel, editUser, editPass)
+        profiles = profiles.mapIndexed { idx, item -> if (idx == selectedIdx) updated else item }
+        return updated
+    }
+
+    fun fillAndSubmitInWebView(user: String, pass: String) {
+        val safeUser = JSONObject.quote(user)
+        val safePass = JSONObject.quote(pass)
+        val js = """
+            (function() {
+                function setVal(el, val) {
+                    if (!el) return;
+                    var proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+                    var setter = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+                    if (setter && setter.set) {
+                        setter.set.call(el, val);
+                    } else {
+                        el.value = val;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                var inputs = Array.from(document.querySelectorAll('input'));
+                var passEl = inputs.find(function(i) { return i.type === 'password'; });
+                var userEl = inputs.find(function(i) {
+                    var t = (i.type || '').toLowerCase();
+                    return t === 'text' || t === 'email' || i.name.toLowerCase().includes('user');
+                });
+                if (userEl && $safeUser.length > 0) setVal(userEl, $safeUser);
+                if (passEl) setVal(passEl, $safePass);
+                setTimeout(function() {
+                    var btn = document.querySelector('button[type="submit"], input[type="submit"], button[id*="login" i], a[id*="login" i], div[id*="login" i], span[id*="login" i]');
+                    if (btn) btn.click();
+                }, 250);
+            })();
+        """.trimIndent()
+        webViewRef?.evaluateJavascript(js, null)
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -89,12 +166,15 @@ fun RouterTab() {
         }
 
         FloatingActionButton(
-            onClick = { showVaultDialog = true },
+            onClick = {
+                profiles = loadProfiles()
+                showVaultDialog = true
+            },
             containerColor = AccentCyan,
             contentColor = BgDark,
             modifier = Modifier.align(Alignment.BottomEnd).padding(18.dp)
         ) {
-            Icon(Icons.Default.Key, contentDescription = "Saved Password & Auto-Login")
+            Icon(Icons.Default.Key, contentDescription = "Saved Routers & Auto-Login")
         }
     }
 
@@ -102,20 +182,56 @@ fun RouterTab() {
         AlertDialog(
             onDismissRequest = { showVaultDialog = false },
             containerColor = CardDark,
-            title = { Text("Router Vault ($detectedGateway)", color = TextPrimary, fontWeight = FontWeight.Bold) },
+            title = {
+                Column {
+                    Text("Saved Router Logins (3)", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    Text("Gateway: $detectedGateway", color = TextSecondary, fontSize = 12.sp)
+                }
+            },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Save your login once, then tap Auto-Login anytime.", fontSize = 12.sp, color = TextSecondary)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        profiles.forEachIndexed { idx, prof ->
+                            FilterChip(
+                                selected = selectedIdx == idx,
+                                onClick = {
+                                    saveCurrentProfile()
+                                    selectedIdx = idx
+                                },
+                                label = {
+                                    Text(
+                                        text = prof.label,
+                                        maxLines = 1,
+                                        fontSize = 12.sp
+                                    )
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
                     OutlinedTextField(
-                        value = username,
-                        onValueChange = { username = it },
+                        value = editLabel,
+                        onValueChange = { editLabel = it },
+                        label = { Text("Router Name (e.g. TP-Link / Router 1)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    OutlinedTextField(
+                        value = editUser,
+                        onValueChange = { editUser = it },
                         label = { Text("Username (if needed)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
+
                     OutlinedTextField(
-                        value = password,
-                        onValueChange = { password = it },
+                        value = editPass,
+                        onValueChange = { editPass = it },
                         label = { Text("Password") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
@@ -126,32 +242,8 @@ fun RouterTab() {
             confirmButton = {
                 Button(
                     onClick = {
-                        val obj = JSONObject().put("user", username).put("pass", password)
-                        prefs.edit().putString(detectedGateway, obj.toString()).apply()
-
-                        val safeUser = JSONObject.quote(username)
-                        val safePass = JSONObject.quote(password)
-                        val js = """
-                            (function() {
-                                function setVal(el, val) {
-                                    if (!el) return;
-                                    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                                    setter.call(el, val);
-                                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                                }
-                                var inputs = Array.from(document.querySelectorAll('input'));
-                                var passEl = inputs.find(i => i.type === 'password' && i.offsetParent !== null);
-                                var userEl = inputs.find(i => (i.type === 'text' || i.type === 'email') && i.offsetParent !== null);
-                                if (userEl) setVal(userEl, $safeUser);
-                                if (passEl) setVal(passEl, $safePass);
-                                setTimeout(function() {
-                                    var btn = document.querySelector('button[type="submit"], input[type="submit"], button[id*="login" i], a[id*="login" i], div[id*="login" i]');
-                                    if (btn) btn.click();
-                                }, 250);
-                            })();
-                        """.trimIndent()
-                        webViewRef?.evaluateJavascript(js, null)
+                        val saved = saveCurrentProfile()
+                        fillAndSubmitInWebView(saved.username, saved.password)
                         showVaultDialog = false
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = BgDark)
@@ -160,8 +252,16 @@ fun RouterTab() {
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showVaultDialog = false }) {
-                    Text("Close", color = TextSecondary)
+                Row {
+                    TextButton(onClick = {
+                        saveCurrentProfile()
+                        showVaultDialog = false
+                    }) {
+                        Text("Save Only", color = AccentGreen)
+                    }
+                    TextButton(onClick = { showVaultDialog = false }) {
+                        Text("Close", color = TextSecondary)
+                    }
                 }
             }
         )
@@ -182,8 +282,8 @@ fun detectGatewayIp(context: Context): String {
         val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val g = wm.dhcpInfo.gateway
         if (g != 0) "${g and 0xFF}.${(g shr 8) and 0xFF}.${(g shr 16) and 0xFF}.${(g shr 24) and 0xFF}"
-        else "192.168.0.1"
+        else "192.168.8.1"
     } catch (_: Exception) {
-        "192.168.0.1"
+        "192.168.8.1"
     }
 }
