@@ -11,8 +11,8 @@ android {
         applicationId = "com.raju.wifipro"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "3.6"
+        versionCode = 7
+        versionName = "7.3"
     }
 
     buildTypes {
