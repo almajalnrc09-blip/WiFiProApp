@@ -14,7 +14,9 @@ import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
 
 val BgDark = Color(0xFF0F172A)
 val CardDark = Color(0xFF1E293B)
@@ -88,8 +90,17 @@ fun WiFiProRoot() {
             when (selectedTab) {
                 0 -> SpeedTestTab()
                 1 -> SignalTab()
-                2 -> RouterTab()
                 3 -> DevicesTab()
+            }
+            // RouterTab kept alive so switching tabs won't reload/logout the router page
+            Box(
+                modifier = if (selectedTab == 2) {
+                    Modifier.fillMaxSize()
+                } else {
+                    Modifier.size(0.dp).alpha(0f)
+                }
+            ) {
+                RouterTab()
             }
         }
     }
