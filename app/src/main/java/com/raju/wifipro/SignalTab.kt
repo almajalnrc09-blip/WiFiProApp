@@ -8,7 +8,9 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
@@ -30,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import kotlinx.coroutines.delay
+import java.util.concurrent.atomic.AtomicReference
 
 private data class CachedNet(
     val ssid: String,
@@ -39,6 +42,32 @@ private data class CachedNet(
     val seenAtMs: Long
 )
 
+private fun pickValidSsid(vararg candidates: String?): String? {
+    for (c in candidates) {
+        val cleaned = c?.removeSurrounding("\"")?.trim() ?: continue
+        if (cleaned.isNotEmpty() &&
+            !cleaned.equals("<unknown ssid>", ignoreCase = true) &&
+            !cleaned.equals("0x", ignoreCase = true)
+        ) {
+            return cleaned
+        }
+    }
+    return null
+}
+
+private fun pickValidBssid(vararg candidates: String?): String {
+    for (c in candidates) {
+        val cleaned = c?.trim() ?: continue
+        if (cleaned.isNotEmpty() &&
+            cleaned != "02:00:00:00:00:00" &&
+            cleaned != "00:00:00:00:00:00"
+        ) {
+            return cleaned
+        }
+    }
+    return ""
+}
+
 @Suppress("DEPRECATION")
 @Composable
 fun SignalTab() {
@@ -46,6 +75,8 @@ fun SignalTab() {
     val wifiManager = remember { context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager }
     val connectivityManager = remember { context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
     val locationManager = remember { context.applicationContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager }
+
+    val callbackWifiInfoRef = remember { AtomicReference<WifiInfo?>(null) }
 
     var isWifiConnected by remember { mutableStateOf(false) }
     var isLocationOn by remember { mutableStateOf(true) }
@@ -88,8 +119,9 @@ fun SignalTab() {
     }
 
     fun triggerScan() {
-        isLocationOn = checkLocationEnabled()
-        if (!isLocationOn) {
+        val locOn = checkLocationEnabled()
+        isLocationOn = locOn
+        if (!locOn) {
             recentMap.clear()
             netList = emptyList()
             scanStatus = "Location Off"
@@ -106,7 +138,8 @@ fun SignalTab() {
         }
     }
 
-    DisposableEffect(context) {
+    // Re-register NetworkCallback & scan receiver whenever Location toggles ON/OFF
+    DisposableEffect(context, isLocationOn) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
                 if (ActivityCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
@@ -125,19 +158,48 @@ fun SignalTab() {
         } else {
             context.registerReceiver(receiver, filter)
         }
+
+        val networkCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            object : ConnectivityManager.NetworkCallback(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) {
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    val info = caps.transportInfo as? WifiInfo
+                    if (info != null) callbackWifiInfoRef.set(info)
+                }
+
+                override fun onLost(network: Network) {
+                    callbackWifiInfoRef.set(null)
+                }
+            }
+        } else {
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onLost(network: Network) {
+                    callbackWifiInfoRef.set(null)
+                }
+            }
+        }
+
+        try {
+            val req = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+            connectivityManager.registerNetworkCallback(req, networkCallback)
+        } catch (_: Exception) {}
+
         triggerScan()
+
         onDispose {
             try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
+            try { connectivityManager.unregisterNetworkCallback(networkCallback) } catch (_: Exception) {}
         }
     }
 
     LaunchedEffect(Unit) {
         var seconds = 0
         while (true) {
-            isLocationOn = checkLocationEnabled()
+            val locNow = checkLocationEnabled()
+            val locJustTurnedOn = !isLocationOn && locNow
+            isLocationOn = locNow
 
-            // Read Wi-Fi transport state & WifiInfo without relying on networkId != -1
-            // (Android sets networkId = -1 when Location is OFF, even though RSSI/Freq/LinkSpeed remain valid!)
             var transportWifi = false
             var capWifiInfo: WifiInfo? = null
             try {
@@ -149,34 +211,25 @@ fun SignalTab() {
                 }
             } catch (_: Exception) {}
 
+            val cbWifiInfo = callbackWifiInfoRef.get()
             val legacyInfo = try { wifiManager.connectionInfo } catch (_: Exception) { null }
-            val primaryInfo = capWifiInfo ?: legacyInfo
-            val hasLiveRadio = (primaryInfo?.frequency ?: 0) > 0 || (primaryInfo?.rssi ?: -127) in -120..-10
+
+            val infoList = listOfNotNull(cbWifiInfo, legacyInfo, capWifiInfo)
+            val hasLiveRadio = infoList.any { it.frequency > 0 || it.rssi in -120..-10 }
             val connectedNow = transportWifi || (legacyInfo != null && (legacyInfo.networkId != -1 || hasLiveRadio))
             isWifiConnected = connectedNow
 
-            if (connectedNow && (primaryInfo != null || legacyInfo != null)) {
-                val activeRssi = when {
-                    capWifiInfo != null && capWifiInfo.rssi in -120..-10 -> capWifiInfo.rssi
-                    legacyInfo != null && legacyInfo.rssi in -120..-10 -> legacyInfo.rssi
-                    else -> -100
-                }
-                val activeFreq = when {
-                    (capWifiInfo?.frequency ?: 0) > 0 -> capWifiInfo!!.frequency
-                    (legacyInfo?.frequency ?: 0) > 0 -> legacyInfo!!.frequency
-                    else -> 0
-                }
-                val activeLink = when {
-                    (capWifiInfo?.linkSpeed ?: 0) > 0 -> capWifiInfo!!.linkSpeed
-                    (legacyInfo?.linkSpeed ?: 0) > 0 -> legacyInfo!!.linkSpeed
-                    else -> 0
-                }
-                val rawSsid = (capWifiInfo?.ssid ?: legacyInfo?.ssid)?.removeSurrounding("\"") ?: ""
-                val isUnknownSsid = rawSsid.isBlank() || rawSsid.equals("<unknown ssid>", ignoreCase = true)
+            if (connectedNow && infoList.isNotEmpty()) {
+                val activeRssi = infoList.firstOrNull { it.rssi in -120..-10 }?.rssi ?: -100
+                val activeFreq = infoList.firstOrNull { it.frequency > 0 }?.frequency ?: 0
+                val activeLink = infoList.firstOrNull { it.linkSpeed > 0 }?.linkSpeed ?: 0
 
-                ssidHiddenByLocation = isUnknownSsid
-                ssid = if (isUnknownSsid) "Connected Wi-Fi" else rawSsid
-                bssid = (capWifiInfo?.bssid ?: legacyInfo?.bssid)?.takeUnless { it == "02:00:00:00:00:00" } ?: ""
+                val realSsid = pickValidSsid(cbWifiInfo?.ssid, legacyInfo?.ssid, capWifiInfo?.ssid)
+                val realBssid = pickValidBssid(cbWifiInfo?.bssid, legacyInfo?.bssid, capWifiInfo?.bssid)
+
+                ssidHiddenByLocation = (realSsid == null)
+                ssid = realSsid ?: "Connected Wi-Fi"
+                bssid = realBssid
                 rssi = activeRssi
                 freq = activeFreq
                 linkSpeed = activeLink
@@ -187,8 +240,8 @@ fun SignalTab() {
                     activeFreq >= 5925 -> "6 GHz"
                     else -> "--"
                 }
-                val stdInfo = capWifiInfo ?: legacyInfo
-                wifiStandard = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && stdInfo != null) {
+                val stdInfo = infoList.first()
+                wifiStandard = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     when (stdInfo.wifiStandard) {
                         ScanResult.WIFI_STANDARD_11AX -> "Wi-Fi 6 (802.11ax)"
                         ScanResult.WIFI_STANDARD_11AC -> "Wi-Fi 5 (802.11ac)"
@@ -211,11 +264,11 @@ fun SignalTab() {
                 wifiStandard = "Unknown"
             }
 
-            if (!isLocationOn) {
+            if (!locNow) {
                 recentMap.clear()
                 netList = emptyList()
                 scanStatus = "Location Off"
-            } else if (seconds > 0 && seconds % 10 == 0) {
+            } else if (locJustTurnedOn || (seconds > 0 && seconds % 10 == 0)) {
                 triggerScan()
             }
             seconds++
@@ -264,7 +317,11 @@ fun SignalTab() {
                         Text(wifiStandard, fontSize = 13.sp, color = AccentCyan)
                         if (isWifiConnected && ssidHiddenByLocation) {
                             Text(
-                                text = "Name hidden by Android (turn on Location to show SSID)",
+                                text = if (!isLocationOn) {
+                                    "Turn on Location (GPS) to show Wi-Fi name"
+                                } else {
+                                    "Allow Location permission to show Wi-Fi name"
+                                },
                                 fontSize = 11.sp,
                                 color = AccentAmber
                             )
