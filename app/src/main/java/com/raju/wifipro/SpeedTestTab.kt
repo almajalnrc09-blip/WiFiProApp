@@ -17,13 +17,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
-private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
+private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"
 
 @Composable
 fun SpeedTestTab() {
@@ -56,7 +59,7 @@ fun SpeedTestTab() {
                     size = arcSize,
                     style = Stroke(width = stroke, cap = StrokeCap.Round)
                 )
-                val progress = (currentMbps.coerceIn(0.0, 200.0) / 200.0).toFloat()
+                val progress = (currentMbps.coerceIn(0.0, 300.0) / 300.0).toFloat()
                 drawArc(
                     color = if (phase.contains("Upload")) AccentGreen else AccentCyan,
                     startAngle = 140f,
@@ -100,11 +103,11 @@ fun SpeedTestTab() {
                         pingMs = measurePing()
 
                         phase = "Testing Download..."
-                        downloadMbps = measureDownload { live -> currentMbps = live }
+                        downloadMbps = measureParallelDownload { live -> currentMbps = live }
 
                         phase = "Testing Upload..."
                         uploadMbps = try {
-                            measureUpload { live -> currentMbps = live }
+                            measureParallelUpload { live -> currentMbps = live }
                         } catch (_: Exception) {
                             0.0
                         }
@@ -143,15 +146,15 @@ private fun SpeedStatCard(title: String, value: String, modifier: Modifier) {
 
 private suspend fun measurePing(): Long = withContext(Dispatchers.IO) {
     var best = Long.MAX_VALUE
-    repeat(3) {
+    repeat(4) {
         val start = System.currentTimeMillis()
-        val conn = URL("https://www.google.com/generate_204").openConnection() as HttpURLConnection
+        val conn = URL("https://speed.cloudflare.com/__down?bytes=1").openConnection() as HttpURLConnection
         conn.connectTimeout = 5000
         conn.readTimeout = 5000
         conn.setRequestProperty("User-Agent", UA)
         conn.requestMethod = "GET"
         conn.connect()
-        conn.responseCode
+        conn.inputStream.read()
         conn.disconnect()
         val elapsed = System.currentTimeMillis() - start
         if (elapsed < best) best = elapsed
@@ -159,87 +162,107 @@ private suspend fun measurePing(): Long = withContext(Dispatchers.IO) {
     if (best == Long.MAX_VALUE) 0L else best
 }
 
-private suspend fun measureDownload(onLive: (Double) -> Unit): Double = withContext(Dispatchers.IO) {
-    val urls = listOf(
-        "https://speed.cloudflare.com/__down?bytes=15000000",
-        "https://proof.ovh.net/files/10Mb.dat"
-    )
-    var lastError: Exception? = null
-    for (urlStr in urls) {
-        try {
-            val conn = URL(urlStr).openConnection() as HttpURLConnection
-            conn.connectTimeout = 8000
-            conn.readTimeout = 10000
-            conn.instanceFollowRedirects = true
-            conn.setRequestProperty("User-Agent", UA)
-            conn.setRequestProperty("Accept", "*/*")
-            conn.setRequestProperty("Cache-Control", "no-cache")
-            if (conn.responseCode !in 200..299) {
-                conn.disconnect()
-                continue
-            }
-            val stream = conn.inputStream
-            val buffer = ByteArray(16384)
-            var totalBytes = 0L
-            val startTime = System.nanoTime()
-            var lastUpdate = startTime
-            while (true) {
-                val read = stream.read(buffer)
-                if (read == -1) break
-                totalBytes += read
-                val now = System.nanoTime()
-                val elapsedSec = (now - startTime) / 1_000_000_000.0
-                if ((now - lastUpdate) > 180_000_000L && elapsedSec > 0.15) {
-                    val mbps = (totalBytes * 8.0) / (elapsedSec * 1_000_000.0)
-                    withContext(Dispatchers.Main) { onLive(mbps) }
-                    lastUpdate = now
-                }
-                if (elapsedSec > 6.0) break
-            }
-            stream.close()
-            conn.disconnect()
-            val totalSec = ((System.nanoTime() - startTime) / 1_000_000_000.0).coerceAtLeast(0.1)
-            return@withContext (totalBytes * 8.0) / (totalSec * 1_000_000.0)
-        } catch (e: Exception) {
-            lastError = e
+private suspend fun measureParallelDownload(onLive: (Double) -> Unit): Double = withContext(Dispatchers.IO) {
+    val streams = 4
+    val maxDurationSec = 7.5
+    val totalBytes = AtomicLong(0L)
+    val startTime = System.nanoTime()
+    var running = true
+
+    val reporter = async {
+        while (running) {
+            kotlinx.coroutines.delay(150)
+            val elapsedSec = ((System.nanoTime() - startTime) / 1_000_000_000.0).coerceAtLeast(0.1)
+            val mbps = (totalBytes.get() * 8.0) / (elapsedSec * 1_000_000.0)
+            withContext(Dispatchers.Main) { onLive(mbps) }
         }
     }
-    throw lastError ?: Exception("Download failed")
+
+    val workers = (1..streams).map { idx ->
+        async {
+            try {
+                val conn = URL("https://speed.cloudflare.com/__down?bytes=100000000&s=$idx").openConnection() as HttpURLConnection
+                conn.connectTimeout = 8000
+                conn.readTimeout = 10000
+                conn.setRequestProperty("User-Agent", UA)
+                conn.setRequestProperty("Accept", "*/*")
+                conn.setRequestProperty("Cache-Control", "no-cache")
+                val input = conn.inputStream
+                val buf = ByteArray(32768)
+                while (true) {
+                    val elapsedSec = (System.nanoTime() - startTime) / 1_000_000_000.0
+                    if (elapsedSec >= maxDurationSec) break
+                    val read = input.read(buf)
+                    if (read == -1) break
+                    totalBytes.addAndGet(read.toLong())
+                }
+                input.close()
+                conn.disconnect()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    workers.awaitAll()
+    running = false
+    reporter.cancel()
+
+    val totalSec = ((System.nanoTime() - startTime) / 1_000_000_000.0).coerceAtLeast(0.2)
+    (totalBytes.get() * 8.0) / (totalSec * 1_000_000.0)
 }
 
-private suspend fun measureUpload(onLive: (Double) -> Unit): Double = withContext(Dispatchers.IO) {
-    val totalToSend = 2_500_000 // 2.5 MB fixed length
-    val conn = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
-    conn.connectTimeout = 8000
-    conn.readTimeout = 12000
-    conn.requestMethod = "POST"
-    conn.doOutput = true
-    conn.setRequestProperty("User-Agent", UA)
-    conn.setRequestProperty("Content-Type", "application/octet-stream")
-    conn.setFixedLengthStreamingMode(totalToSend)
-
-    val chunk = ByteArray(16384) { 0x41 }
-    val out = conn.outputStream
-    var totalBytes = 0
+private suspend fun measureParallelUpload(onLive: (Double) -> Unit): Double = withContext(Dispatchers.IO) {
+    val streams = 3
+    val perStreamBytes = 6_000_000
+    val totalSent = AtomicLong(0L)
     val startTime = System.nanoTime()
-    var lastUpdate = startTime
+    var running = true
 
-    while (totalBytes < totalToSend) {
-        val toWrite = minOf(chunk.size, totalToSend - totalBytes)
-        out.write(chunk, 0, toWrite)
-        totalBytes += toWrite
-        val now = System.nanoTime()
-        val elapsedSec = (now - startTime) / 1_000_000_000.0
-        if ((now - lastUpdate) > 180_000_000L && elapsedSec > 0.15) {
-            val mbps = (totalBytes * 8.0) / (elapsedSec * 1_000_000.0)
+    val reporter = async {
+        while (running) {
+            kotlinx.coroutines.delay(150)
+            val elapsedSec = ((System.nanoTime() - startTime) / 1_000_000_000.0).coerceAtLeast(0.1)
+            val mbps = (totalSent.get() * 8.0) / (elapsedSec * 1_000_000.0)
             withContext(Dispatchers.Main) { onLive(mbps) }
-            lastUpdate = now
         }
     }
-    out.flush()
-    out.close()
-    conn.responseCode
-    conn.disconnect()
-    val totalSec = ((System.nanoTime() - startTime) / 1_000_000_000.0).coerceAtLeast(0.1)
-    (totalBytes * 8.0) / (totalSec * 1_000_000.0)
+
+    val workers = (1..streams).map {
+        async {
+            try {
+                val conn = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
+                conn.connectTimeout = 8000
+                conn.readTimeout = 12000
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.setRequestProperty("User-Agent", UA)
+                conn.setRequestProperty("Content-Type", "application/octet-stream")
+                conn.setFixedLengthStreamingMode(perStreamBytes)
+
+                val chunk = ByteArray(32768) { 0x41 }
+                val out = conn.outputStream
+                var written = 0
+                while (written < perStreamBytes) {
+                    val elapsedSec = (System.nanoTime() - startTime) / 1_000_000_000.0
+                    if (elapsedSec >= 5.5) break
+                    val toWrite = minOf(chunk.size, perStreamBytes - written)
+                    out.write(chunk, 0, toWrite)
+                    written += toWrite
+                    totalSent.addAndGet(toWrite.toLong())
+                }
+                out.flush()
+                out.close()
+                conn.responseCode
+                conn.disconnect()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    workers.awaitAll()
+    running = false
+    reporter.cancel()
+
+    val totalSec = ((System.nanoTime() - startTime) / 1_000_000_000.0).coerceAtLeast(0.2)
+    (totalSent.get() * 8.0) / (totalSec * 1_000_000.0)
 }
