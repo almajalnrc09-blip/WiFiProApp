@@ -2,12 +2,16 @@ package com.raju.wifipro
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import android.net.http.SslError
 import android.net.wifi.WifiManager
 import android.webkit.CookieManager
+import android.webkit.SafeBrowsingResponse
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -78,7 +82,6 @@ fun RouterTab() {
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var showVaultDialog by remember { mutableStateOf(false) }
 
-    // Pending credentials for auto-login when page finishes loading
     var pendingUser by remember { mutableStateOf<String?>(null) }
     var pendingPass by remember { mutableStateOf<String?>(null) }
 
@@ -88,7 +91,10 @@ fun RouterTab() {
     var editPass by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeSlot.password) }
 
     fun saveCurrentSlot(): RouterSlot {
-        val cleanGw = editGateway.trim().removePrefix("http://").removePrefix("https://").ifBlank { detectedGateway }
+        val cleanGw = editGateway.trim()
+            .removePrefix("http://")
+            .removePrefix("https://")
+            .ifBlank { detectedGateway }
         val obj = JSONObject()
             .put("gateway", cleanGw)
             .put("user", editUser)
@@ -140,9 +146,8 @@ fun RouterTab() {
                 }
 
                 function clickLoginButton(passEl) {
-                    // 1. Huawei 5G CPE & TP-Link specific IDs/classes first
                     var directSelectors = [
-                        '#login_btn', '#btn_login', '#loginBtn', '#submit_btn',
+                        '#login_btn', '#btn_login', '#loginBtn', '#submit_btn', '#pc-login-btn',
                         '.login-btn', '.btn-login', 'button[type="submit"]', 'input[type="submit"]'
                     ];
                     for (var s = 0; s < directSelectors.length; s++) {
@@ -153,7 +158,6 @@ fun RouterTab() {
                         }
                     }
 
-                    // 2. Match visible element with exact text "Log In" / "Login"
                     var all = Array.from(document.querySelectorAll('div, button, a, span, input'));
                     for (var i = 0; i < all.length; i++) {
                         var el = all[i];
@@ -166,7 +170,6 @@ fun RouterTab() {
                         }
                     }
 
-                    // 3. Fallback Enter key on password input
                     submitByEnter(passEl);
                     return false;
                 }
@@ -184,7 +187,7 @@ fun RouterTab() {
                 if (passEl) {
                     setNativeValue(passEl, $safePass);
                     setTimeout(function() { clickLoginButton(passEl); }, 350);
-                    setTimeout(function() { clickLoginButton(passEl); }, 950);
+                    setTimeout(function() { clickLoginButton(passEl); }, 1000);
                 }
             })();
         """.trimIndent()
@@ -204,7 +207,6 @@ fun RouterTab() {
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Editable Gateway URL bar + Reload
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -259,31 +261,40 @@ fun RouterTab() {
                         settings.databaseEnabled = true
                         settings.javaScriptCanOpenWindowsAutomatically = true
                         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                        settings.cacheMode = WebSettings.LOAD_DEFAULT
+                        settings.cacheMode = WebSettings.LOAD_NO_CACHE
                         settings.loadWithOverviewMode = true
                         settings.useWideViewPort = true
                         settings.builtInZoomControls = true
                         settings.displayZoomControls = false
-                        // Desktop-compatible UA helps TP-Link & Huawei web panels render cleanly
                         settings.userAgentString =
-                            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                            "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
                         webViewClient = object : WebViewClient() {
-                            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                val nextUrl = request?.url?.toString()
+                                if (!nextUrl.isNullOrBlank()) {
+                                    urlText = nextUrl
+                                }
+                                return false
+                            }
+
+                            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                 super.onPageStarted(view, url, favicon)
                                 isPageLoading = true
+                                pageErrorText = null
                                 if (!url.isNullOrBlank()) urlText = url
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
                                 isPageLoading = false
+                                if (!url.isNullOrBlank()) urlText = url
                                 val u = pendingUser
                                 val p = pendingPass
                                 if (!p.isNullOrEmpty()) {
-                                    // Trigger multiple times to handle SPA frameworks (TP-Link / Huawei)
                                     runAutoFillAndLogin(view, u ?: "admin", p)
                                     view?.postDelayed({ runAutoFillAndLogin(view, u ?: "admin", p) }, 1200)
+                                    view?.postDelayed({ runAutoFillAndLogin(view, u ?: "admin", p) }, 2400)
                                     pendingUser = null
                                     pendingPass = null
                                 }
@@ -294,10 +305,32 @@ fun RouterTab() {
                                 handler?.proceed()
                             }
 
-                            @Suppress("DEPRECATION")
-                            override fun onReceivedError(view: WebView?, errorCode: Int, description: String?, failingUrl: String?) {
-                                isPageLoading = false
-                                pageErrorText = "Cannot reach $failingUrl ($description). Check router IP or AP Isolation."
+                            override fun onSafeBrowsingHit(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                                threatType: Int,
+                                callback: SafeBrowsingResponse?
+                            ) {
+                                callback?.proceed(true)
+                            }
+
+                            override fun onReceivedError(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                                error: WebResourceError?
+                            ) {
+                                if (request?.isForMainFrame == true) {
+                                    val failedUrl = request.url?.toString() ?: ""
+                                    // If http failed on local router IP, retry once with https
+                                    if (failedUrl.startsWith("http://")) {
+                                        val httpsUrl = failedUrl.replaceFirst("http://", "https://")
+                                        urlText = httpsUrl
+                                        view?.loadUrl(httpsUrl)
+                                        return
+                                    }
+                                    isPageLoading = false
+                                    pageErrorText = "Load issue on $failedUrl (${error?.description ?: "Connection failed"})"
+                                }
                             }
                         }
                         webChromeClient = WebChromeClient()
@@ -379,12 +412,13 @@ fun RouterTab() {
                         val saved = saveCurrentSlot()
                         showVaultDialog = false
                         val targetHost = saved.gateway
-                        val currentHost = urlText.removePrefix("http://").removePrefix("https://").substringBefore("/")
+                        val currentHost = urlText
+                            .removePrefix("http://")
+                            .removePrefix("https://")
+                            .substringBefore("/")
                         if (currentHost == targetHost) {
-                            // Already on this router's page: fill & click Log In immediately
                             runAutoFillAndLogin(webViewRef, saved.username, saved.password)
                         } else {
-                            // Navigate to the selected router and auto-login once loaded
                             navigateToUrl(targetHost, saved.username, saved.password)
                         }
                     },
