@@ -26,9 +26,10 @@ import androidx.compose.ui.viewinterop.AndroidView
 import org.json.JSONObject
 import java.net.Inet4Address
 
-private data class RouterProfile(
-    val slotId: String,
-    val label: String,
+private data class RouterSlot(
+    val key: String,
+    val title: String,
+    val gateway: String,
     val username: String,
     val password: String
 )
@@ -37,56 +38,58 @@ private data class RouterProfile(
 @Composable
 fun RouterTab() {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("router_profiles_v2", Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences("router_main_sub_v1", Context.MODE_PRIVATE) }
     val detectedGateway = remember { detectGatewayIp(context) }
 
+    fun loadSlots(): List<RouterSlot> {
+        val mainRaw = prefs.getString("main_router", null)?.let { JSONObject(it) }
+        val subRaw = prefs.getString("sub_router", null)?.let { JSONObject(it) }
+
+        val mainGw = mainRaw?.optString("gateway", "")?.ifBlank { detectedGateway } ?: detectedGateway
+        val subGw = subRaw?.optString("gateway", "")?.ifBlank { "192.168.8.2" } ?: "192.168.8.2"
+
+        return listOf(
+            RouterSlot(
+                key = "main_router",
+                title = "Main Router",
+                gateway = mainGw,
+                username = mainRaw?.optString("user", "admin") ?: "admin",
+                password = mainRaw?.optString("pass", "") ?: ""
+            ),
+            RouterSlot(
+                key = "sub_router",
+                title = "Sub Router",
+                gateway = subGw,
+                username = subRaw?.optString("user", "admin") ?: "admin",
+                password = subRaw?.optString("pass", "") ?: ""
+            )
+        )
+    }
+
+    var slots by remember { mutableStateOf(loadSlots()) }
+    var selectedIdx by remember { mutableIntStateOf(0) }
     var urlText by remember { mutableStateOf("http://$detectedGateway") }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var showVaultDialog by remember { mutableStateOf(false) }
 
-    fun loadProfiles(): List<RouterProfile> {
-        val defaults = listOf(
-            "slot_1" to "TP-Link",
-            "slot_2" to "Huawei",
-            "slot_3" to "Tenda"
-        )
-        return defaults.map { (id, defLabel) ->
-            val raw = prefs.getString(id, null)
-            if (raw != null) {
-                val obj = JSONObject(raw)
-                RouterProfile(
-                    slotId = id,
-                    label = obj.optString("label", defLabel).ifBlank { defLabel },
-                    username = obj.optString("user", "admin"),
-                    password = obj.optString("pass", "")
-                )
-            } else {
-                RouterProfile(id, defLabel, "admin", "")
-            }
-        }
-    }
+    val activeSlot = slots[selectedIdx]
+    var editGateway by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeSlot.gateway) }
+    var editUser by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeSlot.username) }
+    var editPass by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeSlot.password) }
 
-    var profiles by remember { mutableStateOf(loadProfiles()) }
-    var selectedIdx by remember { mutableIntStateOf(0) }
-
-    val activeProfile = profiles[selectedIdx]
-    var editLabel by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeProfile.label) }
-    var editUser by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeProfile.username) }
-    var editPass by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeProfile.password) }
-
-    fun saveCurrentProfile(): RouterProfile {
-        val finalLabel = editLabel.trim().ifBlank { activeProfile.label }
+    fun saveCurrentSlot(): RouterSlot {
+        val cleanGw = editGateway.trim().removePrefix("http://").removePrefix("https://").ifBlank { detectedGateway }
         val obj = JSONObject()
-            .put("label", finalLabel)
+            .put("gateway", cleanGw)
             .put("user", editUser)
             .put("pass", editPass)
-        prefs.edit().putString(activeProfile.slotId, obj.toString()).apply()
-        val updated = RouterProfile(activeProfile.slotId, finalLabel, editUser, editPass)
-        profiles = profiles.mapIndexed { idx, item -> if (idx == selectedIdx) updated else item }
+        prefs.edit().putString(activeSlot.key, obj.toString()).apply()
+        val updated = RouterSlot(activeSlot.key, activeSlot.title, cleanGw, editUser, editPass)
+        slots = slots.mapIndexed { idx, item -> if (idx == selectedIdx) updated else item }
         return updated
     }
 
-    fun triggerAutoFillAndClickLogin(user: String, pass: String) {
+    fun runAutoFillAndLogin(user: String, pass: String) {
         val safeUser = JSONObject.quote(user)
         val safePass = JSONObject.quote(pass)
         val js = """
@@ -94,34 +97,31 @@ fun RouterTab() {
                 function setNativeValue(el, val) {
                     if (!el) return;
                     el.focus();
-                    var protos = [window.HTMLInputElement && window.HTMLInputElement.prototype];
-                    for (var i = 0; i < protos.length; i++) {
-                        var desc = protos[i] && Object.getOwnPropertyDescriptor(protos[i], 'value');
-                        if (desc && desc.set) {
-                            desc.set.call(el, val);
-                            break;
-                        }
+                    var desc = window.HTMLInputElement && Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                    if (desc && desc.set) {
+                        desc.set.call(el, val);
+                    } else {
+                        el.value = val;
                     }
-                    el.value = val;
                     el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
                     el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
                 }
 
-                function tryLoginClick() {
-                    var candidates = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a, div, span'));
-                    for (var i = 0; i < candidates.length; i++) {
-                        var el = candidates[i];
+                function clickLoginNow() {
+                    var btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a, div, span'));
+                    for (var i = 0; i < btns.length; i++) {
+                        var el = btns[i];
+                        var r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
                         var txt = ((el.innerText || el.value || el.textContent || '') + '').trim().toLowerCase();
-                        var idAndClass = ((el.id || '') + ' ' + (el.className || '')).toLowerCase();
-                        var visible = el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
-                        if (!visible) continue;
-                        if (txt === 'log in' || txt === 'login' || txt === 'sign in' || idAndClass.includes('login-btn') || idAndClass.includes('btn_login')) {
+                        var clsId = ((el.id || '') + ' ' + (el.className || '')).toLowerCase();
+                        if (txt === 'log in' || txt === 'login' || txt === 'sign in' || clsId.includes('login-btn') || clsId.includes('btn_login')) {
                             el.click();
                             return true;
                         }
                     }
-                    var fallback = document.querySelector('button[type="submit"], input[type="submit"], button[id*="login" i], a[id*="login" i], div[id*="login" i]');
+                    var fallback = document.querySelector('button[type="submit"], input[type="submit"], button[id*="login" i], a[id*="login" i]');
                     if (fallback) {
                         fallback.click();
                         return true;
@@ -140,22 +140,22 @@ fun RouterTab() {
                 if (userEl && $safeUser.length > 0) setNativeValue(userEl, $safeUser);
                 if (passEl) setNativeValue(passEl, $safePass);
 
-                setTimeout(tryLoginClick, 250);
-                setTimeout(tryLoginClick, 700);
+                setTimeout(clickLoginNow, 250);
+                setTimeout(clickLoginNow, 750);
             })();
         """.trimIndent()
         webViewRef?.evaluateJavascript(js, null)
     }
 
-    fun openGatewayAndAutoLogin(rawUrl: String, user: String, pass: String) {
-        val cleaned = rawUrl.trim()
-        val target = if (cleaned.startsWith("http://") || cleaned.startsWith("https://")) cleaned else "http://$cleaned"
+    fun openGatewayAndAutoLogin(gatewayHost: String, user: String, pass: String) {
+        val clean = gatewayHost.trim()
+        val target = if (clean.startsWith("http://") || clean.startsWith("https://")) clean else "http://$clean"
         urlText = target
         webViewRef?.apply {
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
-                    triggerAutoFillAndClickLogin(user, pass)
+                    runAutoFillAndLogin(user, pass)
                 }
             }
             loadUrl(target)
@@ -164,7 +164,7 @@ fun RouterTab() {
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Editable Gateway URL + Direct Login Button
+            // Editable Gateway URL bar + Reload
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -178,27 +178,13 @@ fun RouterTab() {
                     onValueChange = { urlText = it },
                     singleLine = true,
                     modifier = Modifier.weight(1f),
-                    textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TextPrimary),
+                    textStyle = LocalTextStyle.current.copy(fontSize = 14.sp, color = TextPrimary),
                     shape = RoundedCornerShape(10.dp)
                 )
-                Button(
-                    onClick = {
-                        val currentList = loadProfiles()
-                        profiles = currentList
-                        val p = currentList[selectedIdx]
-                        openGatewayAndAutoLogin(urlText, p.username, p.password)
-                    },
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                    modifier = Modifier.height(44.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = BgDark)
-                ) {
-                    Text("Login", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                }
                 IconButton(
                     onClick = {
-                        val latestGw = detectGatewayIp(context)
-                        val target = if (urlText.isBlank()) "http://$latestGw" else if (urlText.startsWith("http")) urlText else "http://$urlText"
+                        val clean = urlText.trim()
+                        val target = if (clean.startsWith("http://") || clean.startsWith("https://")) clean else "http://$clean"
                         urlText = target
                         webViewRef?.loadUrl(target)
                     },
@@ -229,14 +215,14 @@ fun RouterTab() {
 
         FloatingActionButton(
             onClick = {
-                profiles = loadProfiles()
+                slots = loadSlots()
                 showVaultDialog = true
             },
             containerColor = AccentCyan,
             contentColor = BgDark,
             modifier = Modifier.align(Alignment.BottomEnd).padding(18.dp)
         ) {
-            Icon(Icons.Default.Key, contentDescription = "Saved Routers & Auto-Login")
+            Icon(Icons.Default.Key, contentDescription = "Main & Sub Router Vault")
         }
     }
 
@@ -245,40 +231,31 @@ fun RouterTab() {
             onDismissRequest = { showVaultDialog = false },
             containerColor = CardDark,
             title = {
-                Column {
-                    Text("Saved Router Logins (3)", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                    Text("Gateway: $detectedGateway", color = TextSecondary, fontSize = 12.sp)
-                }
+                Text("Router Login Vault", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 18.sp)
             },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        profiles.forEachIndexed { idx, prof ->
+                        slots.forEachIndexed { idx, slot ->
                             FilterChip(
                                 selected = selectedIdx == idx,
                                 onClick = {
-                                    saveCurrentProfile()
+                                    saveCurrentSlot()
                                     selectedIdx = idx
                                 },
-                                label = {
-                                    Text(
-                                        text = prof.label,
-                                        maxLines = 1,
-                                        fontSize = 12.sp
-                                    )
-                                },
+                                label = { Text(slot.title, fontWeight = FontWeight.SemiBold) },
                                 modifier = Modifier.weight(1f)
                             )
                         }
                     }
 
                     OutlinedTextField(
-                        value = editLabel,
-                        onValueChange = { editLabel = it },
-                        label = { Text("Router Name (e.g. TP-Link / Huawei / Tenda)") },
+                        value = editGateway,
+                        onValueChange = { editGateway = it },
+                        label = { Text("Gateway IP / Address") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -304,9 +281,9 @@ fun RouterTab() {
             confirmButton = {
                 Button(
                     onClick = {
-                        val saved = saveCurrentProfile()
-                        triggerAutoFillAndClickLogin(saved.username, saved.password)
+                        val saved = saveCurrentSlot()
                         showVaultDialog = false
+                        openGatewayAndAutoLogin(saved.gateway, saved.username, saved.password)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = BgDark)
                 ) {
@@ -316,7 +293,7 @@ fun RouterTab() {
             dismissButton = {
                 Row {
                     TextButton(onClick = {
-                        saveCurrentProfile()
+                        saveCurrentSlot()
                         showVaultDialog = false
                     }) {
                         Text("Save Only", color = AccentGreen)
