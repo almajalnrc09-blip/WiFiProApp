@@ -31,8 +31,7 @@ private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrom
 private val DOWNLOAD_SOURCES = listOf(
     "https://speed.cloudflare.com/__down?bytes=50000000",
     "https://ash-speed.hetzner.com/100MB.bin",
-    "https://fsn1-speed.hetzner.com/100MB.bin",
-    "https://nbg1-speed.hetzner.com/100MB.bin"
+    "https://fsn1-speed.hetzner.com/100MB.bin"
 )
 
 private val UPLOAD_SOURCES = listOf(
@@ -66,7 +65,7 @@ fun SpeedTestTab(
                     size = arcSize,
                     style = Stroke(width = stroke, cap = StrokeCap.Round)
                 )
-                val progress = (state.currentMbps.coerceIn(0.0, 250.0) / 250.0).toFloat()
+                val progress = (state.currentMbps.coerceIn(0.0, 220.0) / 220.0).toFloat()
                 drawArc(
                     color = if (state.phase.contains("Upload")) AccentGreen else AccentCyan,
                     startAngle = 140f,
@@ -211,8 +210,8 @@ private suspend fun downloadFromUrl(
         val sep = if (baseUrl.contains("?")) "&" else "?"
         val url = "$baseUrl${sep}s=$streamIdx&r=${System.nanoTime()}"
         val conn = URL(url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 8000
-        conn.readTimeout = 12000
+        conn.connectTimeout = 9000
+        conn.readTimeout = 14000
         conn.instanceFollowRedirects = true
         conn.useCaches = false
         conn.setRequestProperty("User-Agent", UA)
@@ -220,7 +219,7 @@ private suspend fun downloadFromUrl(
         conn.setRequestProperty("Cache-Control", "no-cache")
         conn.connect()
         if (conn.responseCode in 200..299) {
-            val buf = ByteArray(65536)
+            val buf = ByteArray(32768)
             conn.inputStream.use { input ->
                 while (true) {
                     val elapsed = (System.nanoTime() - startNano) / 1_000_000_000.0
@@ -238,30 +237,33 @@ private suspend fun downloadFromUrl(
 
 private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Double) -> Unit): Double =
     withContext(Dispatchers.IO) {
-        val streamCount = 6
-        val durationSec = 9.0
-        val warmupSec = 1.0
-        val maxTotalBytes = 150_000_000L
+        // 4 steady streams over ~12s with 1.5s warmup so spikes are smoothed and download isn't skipped
+        val streamCount = 4
+        val durationSec = 12.0
+        val warmupSec = 1.5
+        val maxTotalBytes = 140_000_000L
         val totalBytes = AtomicLong(0L)
         val warmupBytes = AtomicLong(0L)
         val startNano = System.nanoTime()
         var warmupRecorded = false
         var active = true
+        var smoothedMbps = 0.0
 
         val liveJob = async {
             while (active) {
-                delay(160)
+                delay(250)
                 val sec = (System.nanoTime() - startNano) / 1_000_000_000.0
                 if (sec >= warmupSec) {
                     if (!warmupRecorded) {
                         warmupBytes.set(totalBytes.get())
                         warmupRecorded = true
                     }
-                    val postWarmupSec = (sec - warmupSec).coerceAtLeast(0.25)
+                    val postWarmupSec = (sec - warmupSec).coerceAtLeast(0.4)
                     val postWarmupBytes = (totalBytes.get() - warmupBytes.get()).coerceAtLeast(0L)
                     if (postWarmupBytes > 0L) {
-                        val mbps = (postWarmupBytes * 8.0) / (postWarmupSec * 1_000_000.0)
-                        withContext(Dispatchers.Main) { onLive(mbps, mbps) }
+                        val rawMbps = (postWarmupBytes * 8.0) / (postWarmupSec * 1_000_000.0)
+                        smoothedMbps = if (smoothedMbps == 0.0) rawMbps else (smoothedMbps * 0.65 + rawMbps * 0.35)
+                        withContext(Dispatchers.Main) { onLive(smoothedMbps, smoothedMbps) }
                     }
                 }
             }
@@ -271,11 +273,11 @@ private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Doub
             async {
                 val primaryUrl = DOWNLOAD_SOURCES[idx % DOWNLOAD_SOURCES.size]
                 downloadFromUrl(primaryUrl, idx, startNano, durationSec, maxTotalBytes, totalBytes)
-                // If primary stream yielded very little data early on, try fallback source
+                // Retry once if stream ended early before durationSec
                 val elapsed = (System.nanoTime() - startNano) / 1_000_000_000.0
-                if (elapsed < durationSec - 1.5 && totalBytes.get() < 5_000_000L) {
+                if (elapsed < durationSec - 2.0) {
                     val fallbackUrl = DOWNLOAD_SOURCES[(idx + 1) % DOWNLOAD_SOURCES.size]
-                    downloadFromUrl(fallbackUrl, idx + 10, startNano, durationSec, maxTotalBytes, totalBytes)
+                    downloadFromUrl(fallbackUrl, idx + 20, startNano, durationSec, maxTotalBytes, totalBytes)
                 }
             }
         }
@@ -285,27 +287,30 @@ private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Doub
         liveJob.cancel()
 
         val totalSec = (System.nanoTime() - startNano) / 1_000_000_000.0
-        val postWarmupSec = (totalSec - warmupSec).coerceAtLeast(0.4)
+        val postWarmupSec = (totalSec - warmupSec).coerceAtLeast(0.6)
         val postWarmupBytes = (totalBytes.get() - warmupBytes.get()).coerceAtLeast(totalBytes.get() / 2)
         if (postWarmupBytes <= 0L) 0.0 else (postWarmupBytes * 8.0) / (postWarmupSec * 1_000_000.0)
     }
 
 private suspend fun measureUpload(onLive: (liveMbps: Double, partialMbps: Double) -> Unit): Double =
     withContext(Dispatchers.IO) {
-        val streamCount = 4
-        val perStreamBytes = 6_000_000
+        val streamCount = 3
+        val perStreamBytes = 7_000_000
+        val durationSec = 9.0
         val totalSent = AtomicLong(0L)
         val startNano = System.nanoTime()
         var active = true
+        var smoothedMbps = 0.0
 
         val liveJob = async {
             while (active) {
-                delay(160)
-                val sec = ((System.nanoTime() - startNano) / 1_000_000_000.0).coerceAtLeast(0.25)
+                delay(250)
+                val sec = ((System.nanoTime() - startNano) / 1_000_000_000.0).coerceAtLeast(0.4)
                 val bytes = totalSent.get()
                 if (bytes > 0L) {
-                    val mbps = (bytes * 8.0) / (sec * 1_000_000.0)
-                    withContext(Dispatchers.Main) { onLive(mbps, mbps) }
+                    val rawMbps = (bytes * 8.0) / (sec * 1_000_000.0)
+                    smoothedMbps = if (smoothedMbps == 0.0) rawMbps else (smoothedMbps * 0.65 + rawMbps * 0.35)
+                    withContext(Dispatchers.Main) { onLive(smoothedMbps, smoothedMbps) }
                 }
             }
         }
@@ -315,20 +320,20 @@ private suspend fun measureUpload(onLive: (liveMbps: Double, partialMbps: Double
                 val targetUrl = UPLOAD_SOURCES[idx % UPLOAD_SOURCES.size]
                 try {
                     val conn = URL(targetUrl).openConnection() as HttpURLConnection
-                    conn.connectTimeout = 8000
-                    conn.readTimeout = 12000
+                    conn.connectTimeout = 9000
+                    conn.readTimeout = 14000
                     conn.requestMethod = "POST"
                     conn.doOutput = true
                     conn.setRequestProperty("User-Agent", UA)
                     conn.setRequestProperty("Content-Type", "application/octet-stream")
                     conn.setFixedLengthStreamingMode(perStreamBytes)
 
-                    val chunk = ByteArray(65536) { 0x5A }
+                    val chunk = ByteArray(32768) { 0x5A }
                     var written = 0
                     conn.outputStream.use { out ->
                         while (written < perStreamBytes) {
                             val elapsed = (System.nanoTime() - startNano) / 1_000_000_000.0
-                            if (elapsed >= 7.0) break
+                            if (elapsed >= durationSec) break
                             val step = minOf(chunk.size, perStreamBytes - written)
                             out.write(chunk, 0, step)
                             written += step
@@ -347,7 +352,7 @@ private suspend fun measureUpload(onLive: (liveMbps: Double, partialMbps: Double
         active = false
         liveJob.cancel()
 
-        val finalSec = ((System.nanoTime() - startNano) / 1_000_000_000.0).coerceAtLeast(0.35)
+        val finalSec = ((System.nanoTime() - startNano) / 1_000_000_000.0).coerceAtLeast(0.5)
         val finalBytes = totalSent.get()
         if (finalBytes <= 0L) 0.0 else (finalBytes * 8.0) / (finalSec * 1_000_000.0)
     }
