@@ -17,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 
 val BgDark = Color(0xFF0F172A)
 val CardDark = Color(0xFF1E293B)
@@ -25,6 +26,15 @@ val AccentGreen = Color(0xFF22C55E)
 val AccentAmber = Color(0xFFF59E0B)
 val TextPrimary = Color(0xFFF8FAFC)
 val TextSecondary = Color(0xFF94A3B8)
+
+class SpeedTestState {
+    var isTesting by mutableStateOf(false)
+    var phase by mutableStateOf("Ready to Test")
+    var currentMbps by mutableDoubleStateOf(0.0)
+    var pingMs by mutableLongStateOf(0L)
+    var downloadMbps by mutableDoubleStateOf(0.0)
+    var uploadMbps by mutableDoubleStateOf(0.0)
+}
 
 class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
@@ -57,6 +67,9 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun WiFiProRoot() {
     var selectedTab by remember { mutableIntStateOf(0) }
+    val appScope = rememberCoroutineScope()
+    val speedState = remember { SpeedTestState() }
+
     val tabs = listOf(
         Pair("Speed", Icons.Default.Speed),
         Pair("Signal", Icons.Default.Wifi),
@@ -88,11 +101,21 @@ fun WiFiProRoot() {
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
             when (selectedTab) {
-                0 -> SpeedTestTab()
+                0 -> SpeedTestTab(
+                    state = speedState,
+                    onStartTest = {
+                        if (!speedState.isTesting) {
+                            appScope.launch {
+                                runFullSpeedTest(speedState)
+                            }
+                        }
+                    }
+                )
                 1 -> SignalTab()
                 3 -> DevicesTab()
             }
-            // RouterTab kept alive so switching tabs won't reload/logout the router page
+
+            // RouterTab kept alive in background
             Box(
                 modifier = if (selectedTab == 2) {
                     Modifier.fillMaxSize()
