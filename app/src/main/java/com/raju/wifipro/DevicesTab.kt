@@ -28,6 +28,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -59,9 +60,9 @@ fun DevicesTab() {
             devices = emptyList()
             val myIp = getLocalIp(context)
             val gatewayIp = detectGatewayIp(context)
-            val subnet = myIp.substringBeforeLast(".", "192.168.0")
-            val found = mutableListOf<LanDevice>()
-            val semaphore = Semaphore(40)
+            val subnet = myIp.substringBeforeLast(".", "192.168.8")
+            val foundMap = mutableMapOf<String, LanDevice>()
+            val semaphore = Semaphore(48)
             var done = 0
 
             withContext(Dispatchers.IO) {
@@ -83,21 +84,49 @@ fun DevicesTab() {
                                 }
                                 val defaultName = if (tag != "Active Device") tag else hostName
                                 val finalName = getSavedOrDefaultName(ip, defaultName)
-                                synchronized(found) {
-                                    found.add(LanDevice(ip, finalName, tag))
+                                synchronized(foundMap) {
+                                    foundMap[ip] = LanDevice(ip, finalName, tag)
                                 }
                             }
                             done++
                             if (done % 10 == 0 || done == 254) {
                                 withContext(Dispatchers.Main) {
                                     progress = done / 254f
-                                    devices = synchronized(found) { found.sortedBy { it.ip.substringAfterLast(".").toIntOrNull() ?: 999 } }
+                                    devices = synchronized(foundMap) {
+                                        foundMap.values.sortedBy { it.ip.substringAfterLast(".").toIntOrNull() ?: 999 }
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 jobs.awaitAll()
+
+                // Also merge entries present in kernel ARP table on this subnet
+                readArpIps(subnet).forEach { ip ->
+                    synchronized(foundMap) {
+                        if (!foundMap.containsKey(ip)) {
+                            val tag = when (ip) {
+                                gatewayIp -> "Router / Gateway"
+                                myIp -> "This Phone"
+                                else -> "Active Device"
+                            }
+                            val hostName = try {
+                                val h = InetAddress.getByName(ip).canonicalHostName
+                                if (h == ip) "Network Device" else h
+                            } catch (_: Exception) { "Network Device" }
+                            val defaultName = if (tag != "Active Device") tag else hostName
+                            foundMap[ip] = LanDevice(ip, getSavedOrDefaultName(ip, defaultName), tag)
+                        }
+                    }
+                }
+
+                withContext(Dispatchers.Main) {
+                    progress = 1f
+                    devices = synchronized(foundMap) {
+                        foundMap.values.sortedBy { it.ip.substringAfterLast(".").toIntOrNull() ?: 999 }
+                    }
+                }
             }
             isScanning = false
         }
@@ -128,7 +157,7 @@ fun DevicesTab() {
         Spacer(Modifier.height(12.dp))
 
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(devices) { dev ->
+            items(devices, key = { it.ip }) { dev ->
                 Card(
                     modifier = Modifier.fillMaxWidth().clickable {
                         editingDevice = dev
@@ -206,17 +235,33 @@ fun DevicesTab() {
 
 private fun checkHostReachable(ip: String): Boolean {
     try {
-        if (InetAddress.getByName(ip).isReachable(280)) return true
+        if (InetAddress.getByName(ip).isReachable(300)) return true
     } catch (_: Exception) {}
-    for (port in intArrayOf(80, 554)) {
+    for (port in intArrayOf(80, 443, 554, 8080, 5353, 62078)) {
         try {
             Socket().use { s ->
-                s.connect(InetSocketAddress(ip, port), 150)
+                s.connect(InetSocketAddress(ip, port), 130)
                 return true
             }
         } catch (_: Exception) {}
     }
     return false
+}
+
+private fun readArpIps(subnet: String): List<String> {
+    return try {
+        val f = File("/proc/net/arp")
+        if (!f.exists()) return emptyList()
+        f.readLines().drop(1).mapNotNull { line ->
+            val parts = line.trim().split(Regex("\\s+"))
+            val ip = parts.getOrNull(0) ?: return@mapNotNull null
+            val flags = parts.getOrNull(2) ?: ""
+            // 0x2 means complete/reachable ARP entry
+            if (ip.startsWith("$subnet.") && flags != "0x0") ip else null
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
 }
 
 @Suppress("DEPRECATION")
@@ -226,6 +271,6 @@ private fun getLocalIp(context: Context): String {
         val ip = wm.connectionInfo.ipAddress
         "${ip and 0xFF}.${(ip shr 8) and 0xFF}.${(ip shr 16) and 0xFF}.${(ip shr 24) and 0xFF}"
     } catch (_: Exception) {
-        "192.168.0.100"
+        "192.168.8.100"
     }
 }
