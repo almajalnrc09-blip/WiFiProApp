@@ -3,8 +3,12 @@ package com.raju.wifipro
 import android.annotation.SuppressLint
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.http.SslError
 import android.net.wifi.WifiManager
+import android.webkit.CookieManager
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.*
@@ -69,8 +73,14 @@ fun RouterTab() {
     var slots by remember { mutableStateOf(loadSlots()) }
     var selectedIdx by remember { mutableIntStateOf(0) }
     var urlText by remember { mutableStateOf("http://$detectedGateway") }
+    var isPageLoading by remember { mutableStateOf(false) }
+    var pageErrorText by remember { mutableStateOf<String?>(null) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var showVaultDialog by remember { mutableStateOf(false) }
+
+    // Pending credentials for auto-login when page finishes loading
+    var pendingUser by remember { mutableStateOf<String?>(null) }
+    var pendingPass by remember { mutableStateOf<String?>(null) }
 
     val activeSlot = slots[selectedIdx]
     var editGateway by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeSlot.gateway) }
@@ -89,7 +99,8 @@ fun RouterTab() {
         return updated
     }
 
-    fun runAutoFillAndLogin(user: String, pass: String) {
+    fun runAutoFillAndLogin(view: WebView?, user: String, pass: String) {
+        if (view == null || pass.isEmpty()) return
         val safeUser = JSONObject.quote(user)
         val safePass = JSONObject.quote(pass)
         val js = """
@@ -105,27 +116,58 @@ fun RouterTab() {
                     }
                     el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', bubbles: true }));
                 }
 
-                function clickLoginNow() {
-                    var btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a, div, span'));
-                    for (var i = 0; i < btns.length; i++) {
-                        var el = btns[i];
-                        var r = el.getBoundingClientRect();
-                        if (r.width <= 0 || r.height <= 0) continue;
-                        var txt = ((el.innerText || el.value || el.textContent || '') + '').trim().toLowerCase();
-                        var clsId = ((el.id || '') + ' ' + (el.className || '')).toLowerCase();
-                        if (txt === 'log in' || txt === 'login' || txt === 'sign in' || clsId.includes('login-btn') || clsId.includes('btn_login')) {
-                            el.click();
+                function fireFullClick(el) {
+                    if (!el) return;
+                    try {
+                        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    } catch(e) {}
+                    try { el.click(); } catch(e) {}
+                }
+
+                function submitByEnter(el) {
+                    if (!el) return;
+                    el.focus();
+                    ['keydown', 'keypress', 'keyup'].forEach(function(evtName) {
+                        el.dispatchEvent(new KeyboardEvent(evtName, {
+                            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
+                        }));
+                    });
+                }
+
+                function clickLoginButton(passEl) {
+                    // 1. Huawei 5G CPE & TP-Link specific IDs/classes first
+                    var directSelectors = [
+                        '#login_btn', '#btn_login', '#loginBtn', '#submit_btn',
+                        '.login-btn', '.btn-login', 'button[type="submit"]', 'input[type="submit"]'
+                    ];
+                    for (var s = 0; s < directSelectors.length; s++) {
+                        var found = document.querySelector(directSelectors[s]);
+                        if (found) {
+                            fireFullClick(found);
                             return true;
                         }
                     }
-                    var fallback = document.querySelector('button[type="submit"], input[type="submit"], button[id*="login" i], a[id*="login" i]');
-                    if (fallback) {
-                        fallback.click();
-                        return true;
+
+                    // 2. Match visible element with exact text "Log In" / "Login"
+                    var all = Array.from(document.querySelectorAll('div, button, a, span, input'));
+                    for (var i = 0; i < all.length; i++) {
+                        var el = all[i];
+                        var r = el.getBoundingClientRect();
+                        if (r.width <= 10 || r.height <= 10) continue;
+                        var txt = ((el.innerText || el.value || '') + '').trim().toLowerCase();
+                        if (txt === 'log in' || txt === 'login' || txt === 'sign in') {
+                            fireFullClick(el);
+                            return true;
+                        }
                     }
+
+                    // 3. Fallback Enter key on password input
+                    submitByEnter(passEl);
                     return false;
                 }
 
@@ -134,32 +176,30 @@ fun RouterTab() {
                 var userEl = inputs.find(function(i) {
                     var t = (i.type || '').toLowerCase();
                     var n = (i.name || '').toLowerCase();
-                    return t === 'text' || t === 'email' || n.includes('user');
+                    var id = (i.id || '').toLowerCase();
+                    return t === 'text' || t === 'email' || n.includes('user') || id.includes('user');
                 });
 
                 if (userEl && $safeUser.length > 0) setNativeValue(userEl, $safeUser);
-                if (passEl) setNativeValue(passEl, $safePass);
-
-                setTimeout(clickLoginNow, 250);
-                setTimeout(clickLoginNow, 750);
+                if (passEl) {
+                    setNativeValue(passEl, $safePass);
+                    setTimeout(function() { clickLoginButton(passEl); }, 350);
+                    setTimeout(function() { clickLoginButton(passEl); }, 950);
+                }
             })();
         """.trimIndent()
-        webViewRef?.evaluateJavascript(js, null)
+        view.evaluateJavascript(js, null)
     }
 
-    fun openGatewayAndAutoLogin(gatewayHost: String, user: String, pass: String) {
-        val clean = gatewayHost.trim()
+    fun navigateToUrl(rawHost: String, autoUser: String? = null, autoPass: String? = null) {
+        val clean = rawHost.trim()
         val target = if (clean.startsWith("http://") || clean.startsWith("https://")) clean else "http://$clean"
         urlText = target
-        webViewRef?.apply {
-            webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    runAutoFillAndLogin(user, pass)
-                }
-            }
-            loadUrl(target)
-        }
+        pageErrorText = null
+        pendingUser = autoUser
+        pendingPass = autoPass
+        webViewRef?.stopLoading()
+        webViewRef?.loadUrl(target)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -182,15 +222,28 @@ fun RouterTab() {
                     shape = RoundedCornerShape(10.dp)
                 )
                 IconButton(
-                    onClick = {
-                        val clean = urlText.trim()
-                        val target = if (clean.startsWith("http://") || clean.startsWith("https://")) clean else "http://$clean"
-                        urlText = target
-                        webViewRef?.loadUrl(target)
-                    },
+                    onClick = { navigateToUrl(urlText) },
                     modifier = Modifier.size(38.dp)
                 ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Reload", tint = AccentCyan)
+                    Icon(Icons.Default.Refresh, contentDescription = "Go / Reload", tint = AccentCyan)
+                }
+            }
+
+            if (isPageLoading) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(3.dp), color = AccentCyan)
+            }
+
+            if (pageErrorText != null) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
+                    colors = CardDefaults.cardColors(containerColor = CardDark)
+                ) {
+                    Text(
+                        text = pageErrorText ?: "",
+                        color = AccentAmber,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(10.dp)
+                    )
                 }
             }
 
@@ -198,13 +251,55 @@ fun RouterTab() {
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
                     WebView(ctx).apply {
+                        CookieManager.getInstance().setAcceptCookie(true)
+                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
+                        settings.databaseEnabled = true
+                        settings.javaScriptCanOpenWindowsAutomatically = true
+                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        settings.cacheMode = WebSettings.LOAD_DEFAULT
                         settings.loadWithOverviewMode = true
                         settings.useWideViewPort = true
                         settings.builtInZoomControls = true
                         settings.displayZoomControls = false
-                        webViewClient = WebViewClient()
+                        // Desktop-compatible UA helps TP-Link & Huawei web panels render cleanly
+                        settings.userAgentString =
+                            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                                super.onPageStarted(view, url, favicon)
+                                isPageLoading = true
+                                if (!url.isNullOrBlank()) urlText = url
+                            }
+
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                super.onPageFinished(view, url)
+                                isPageLoading = false
+                                val u = pendingUser
+                                val p = pendingPass
+                                if (!p.isNullOrEmpty()) {
+                                    // Trigger multiple times to handle SPA frameworks (TP-Link / Huawei)
+                                    runAutoFillAndLogin(view, u ?: "admin", p)
+                                    view?.postDelayed({ runAutoFillAndLogin(view, u ?: "admin", p) }, 1200)
+                                    pendingUser = null
+                                    pendingPass = null
+                                }
+                            }
+
+                            @SuppressLint("WebViewClientOnReceivedSslError")
+                            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                                handler?.proceed()
+                            }
+
+                            @Suppress("DEPRECATION")
+                            override fun onReceivedError(view: WebView?, errorCode: Int, description: String?, failingUrl: String?) {
+                                isPageLoading = false
+                                pageErrorText = "Cannot reach $failingUrl ($description). Check router IP or AP Isolation."
+                            }
+                        }
                         webChromeClient = WebChromeClient()
                         loadUrl(urlText)
                         webViewRef = this
@@ -283,7 +378,15 @@ fun RouterTab() {
                     onClick = {
                         val saved = saveCurrentSlot()
                         showVaultDialog = false
-                        openGatewayAndAutoLogin(saved.gateway, saved.username, saved.password)
+                        val targetHost = saved.gateway
+                        val currentHost = urlText.removePrefix("http://").removePrefix("https://").substringBefore("/")
+                        if (currentHost == targetHost) {
+                            // Already on this router's page: fill & click Log In immediately
+                            runAutoFillAndLogin(webViewRef, saved.username, saved.password)
+                        } else {
+                            // Navigate to the selected router and auto-login once loaded
+                            navigateToUrl(targetHost, saved.username, saved.password)
+                        }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = BgDark)
                 ) {
