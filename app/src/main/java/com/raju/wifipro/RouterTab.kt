@@ -86,48 +86,91 @@ fun RouterTab() {
         return updated
     }
 
-    fun fillAndSubmitInWebView(user: String, pass: String) {
+    fun triggerAutoFillAndClickLogin(user: String, pass: String) {
         val safeUser = JSONObject.quote(user)
         val safePass = JSONObject.quote(pass)
         val js = """
             (function() {
-                function setVal(el, val) {
+                function setNativeValue(el, val) {
                     if (!el) return;
-                    var proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
-                    var setter = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
-                    if (setter && setter.set) {
-                        setter.set.call(el, val);
-                    } else {
-                        el.value = val;
+                    el.focus();
+                    var protos = [window.HTMLInputElement && window.HTMLInputElement.prototype];
+                    for (var i = 0; i < protos.length; i++) {
+                        var desc = protos[i] && Object.getOwnPropertyDescriptor(protos[i], 'value');
+                        if (desc && desc.set) {
+                            desc.set.call(el, val);
+                            break;
+                        }
                     }
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.value = val;
+                    el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
                 }
+
+                function tryLoginClick() {
+                    var candidates = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a, div, span'));
+                    for (var i = 0; i < candidates.length; i++) {
+                        var el = candidates[i];
+                        var txt = ((el.innerText || el.value || el.textContent || '') + '').trim().toLowerCase();
+                        var idAndClass = ((el.id || '') + ' ' + (el.className || '')).toLowerCase();
+                        var visible = el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
+                        if (!visible) continue;
+                        if (txt === 'log in' || txt === 'login' || txt === 'sign in' || idAndClass.includes('login-btn') || idAndClass.includes('btn_login')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    var fallback = document.querySelector('button[type="submit"], input[type="submit"], button[id*="login" i], a[id*="login" i], div[id*="login" i]');
+                    if (fallback) {
+                        fallback.click();
+                        return true;
+                    }
+                    return false;
+                }
+
                 var inputs = Array.from(document.querySelectorAll('input'));
-                var passEl = inputs.find(function(i) { return i.type === 'password'; });
+                var passEl = inputs.find(function(i) { return (i.type || '').toLowerCase() === 'password'; });
                 var userEl = inputs.find(function(i) {
                     var t = (i.type || '').toLowerCase();
-                    return t === 'text' || t === 'email' || i.name.toLowerCase().includes('user');
+                    var n = (i.name || '').toLowerCase();
+                    return t === 'text' || t === 'email' || n.includes('user');
                 });
-                if (userEl && $safeUser.length > 0) setVal(userEl, $safeUser);
-                if (passEl) setVal(passEl, $safePass);
-                setTimeout(function() {
-                    var btn = document.querySelector('button[type="submit"], input[type="submit"], button[id*="login" i], a[id*="login" i], div[id*="login" i], span[id*="login" i]');
-                    if (btn) btn.click();
-                }, 250);
+
+                if (userEl && $safeUser.length > 0) setNativeValue(userEl, $safeUser);
+                if (passEl) setNativeValue(passEl, $safePass);
+
+                setTimeout(tryLoginClick, 250);
+                setTimeout(tryLoginClick, 700);
             })();
         """.trimIndent()
         webViewRef?.evaluateJavascript(js, null)
     }
 
+    fun openGatewayAndAutoLogin(rawUrl: String, user: String, pass: String) {
+        val cleaned = rawUrl.trim()
+        val target = if (cleaned.startsWith("http://") || cleaned.startsWith("https://")) cleaned else "http://$cleaned"
+        urlText = target
+        webViewRef?.apply {
+            webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    triggerAutoFillAndClickLogin(user, pass)
+                }
+            }
+            loadUrl(target)
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
+            // Editable Gateway URL + Direct Login Button
             Row(
-                modifier = Modifier.fillMaxWidth().padding(8.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                IconButton(onClick = { webViewRef?.goBack() }) {
+                IconButton(onClick = { webViewRef?.goBack() }, modifier = Modifier.size(38.dp)) {
                     Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = TextPrimary)
                 }
                 OutlinedTextField(
@@ -135,14 +178,33 @@ fun RouterTab() {
                     onValueChange = { urlText = it },
                     singleLine = true,
                     modifier = Modifier.weight(1f),
-                    textStyle = LocalTextStyle.current.copy(fontSize = 14.sp, color = TextPrimary),
+                    textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TextPrimary),
                     shape = RoundedCornerShape(10.dp)
                 )
-                IconButton(onClick = {
-                    val target = if (urlText.startsWith("http")) urlText else "http://$urlText"
-                    webViewRef?.loadUrl(target)
-                }) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Go/Reload", tint = AccentCyan)
+                Button(
+                    onClick = {
+                        val currentList = loadProfiles()
+                        profiles = currentList
+                        val p = currentList[selectedIdx]
+                        openGatewayAndAutoLogin(urlText, p.username, p.password)
+                    },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                    modifier = Modifier.height(44.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = BgDark)
+                ) {
+                    Text("Login", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+                IconButton(
+                    onClick = {
+                        val latestGw = detectGatewayIp(context)
+                        val target = if (urlText.isBlank()) "http://$latestGw" else if (urlText.startsWith("http")) urlText else "http://$urlText"
+                        urlText = target
+                        webViewRef?.loadUrl(target)
+                    },
+                    modifier = Modifier.size(38.dp)
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Reload", tint = AccentCyan)
                 }
             }
 
@@ -216,7 +278,7 @@ fun RouterTab() {
                     OutlinedTextField(
                         value = editLabel,
                         onValueChange = { editLabel = it },
-                        label = { Text("Router Name (e.g. TP-Link / Router 1)") },
+                        label = { Text("Router Name (e.g. TP-Link / Huawei / Tenda)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -243,7 +305,7 @@ fun RouterTab() {
                 Button(
                     onClick = {
                         val saved = saveCurrentProfile()
-                        fillAndSubmitInWebView(saved.username, saved.password)
+                        triggerAutoFillAndClickLogin(saved.username, saved.password)
                         showVaultDialog = false
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = BgDark)
