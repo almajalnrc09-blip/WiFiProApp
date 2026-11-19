@@ -20,7 +20,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
@@ -30,15 +29,10 @@ import java.util.concurrent.atomic.AtomicLong
 private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"
 
 @Composable
-fun SpeedTestTab() {
-    val scope = rememberCoroutineScope()
-    var isTesting by remember { mutableStateOf(false) }
-    var phase by remember { mutableStateOf("Ready to Test") }
-    var currentMbps by remember { mutableDoubleStateOf(0.0) }
-    var pingMs by remember { mutableLongStateOf(0L) }
-    var downloadMbps by remember { mutableDoubleStateOf(0.0) }
-    var uploadMbps by remember { mutableDoubleStateOf(0.0) }
-
+fun SpeedTestTab(
+    state: SpeedTestState,
+    onStartTest: () -> Unit
+) {
     Column(
         modifier = Modifier.fillMaxSize().padding(20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -60,9 +54,9 @@ fun SpeedTestTab() {
                     size = arcSize,
                     style = Stroke(width = stroke, cap = StrokeCap.Round)
                 )
-                val progress = (currentMbps.coerceIn(0.0, 220.0) / 220.0).toFloat()
+                val progress = (state.currentMbps.coerceIn(0.0, 250.0) / 250.0).toFloat()
                 drawArc(
-                    color = if (phase.contains("Upload")) AccentGreen else AccentCyan,
+                    color = if (state.phase.contains("Upload")) AccentGreen else AccentCyan,
                     startAngle = 140f,
                     sweepAngle = 260f * progress,
                     useCenter = false,
@@ -73,14 +67,14 @@ fun SpeedTestTab() {
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
-                    text = String.format(Locale.US, "%.1f", currentMbps),
+                    text = String.format(Locale.US, "%.1f", state.currentMbps),
                     fontSize = 44.sp,
                     fontWeight = FontWeight.Bold,
                     color = TextPrimary
                 )
                 Text("Mbps", fontSize = 16.sp, color = TextSecondary)
                 Spacer(Modifier.height(6.dp))
-                Text(phase, fontSize = 13.sp, color = AccentCyan)
+                Text(state.phase, fontSize = 13.sp, color = AccentCyan)
             }
         }
 
@@ -90,74 +84,31 @@ fun SpeedTestTab() {
         ) {
             SpeedStatCard(
                 title = "Ping",
-                value = if (pingMs > 0) "$pingMs ms" else "--",
+                value = if (state.pingMs > 0) "${state.pingMs} ms" else "--",
                 modifier = Modifier.weight(1f)
             )
             SpeedStatCard(
                 title = "Download",
-                value = if (downloadMbps > 0.0) String.format(Locale.US, "%.1f", downloadMbps) + " Mbps" else "--",
+                value = if (state.downloadMbps > 0.0) String.format(Locale.US, "%.1f", state.downloadMbps) + " Mbps" else "--",
                 modifier = Modifier.weight(1f)
             )
             SpeedStatCard(
                 title = "Upload",
-                value = if (uploadMbps > 0.0) String.format(Locale.US, "%.1f", uploadMbps) + " Mbps" else "--",
+                value = if (state.uploadMbps > 0.0) String.format(Locale.US, "%.1f", state.uploadMbps) + " Mbps" else "--",
                 modifier = Modifier.weight(1f)
             )
         }
 
         Button(
-            onClick = {
-                if (isTesting) return@Button
-                scope.launch {
-                    isTesting = true
-                    pingMs = 0L
-                    downloadMbps = 0.0
-                    uploadMbps = 0.0
-                    currentMbps = 0.0
-                    try {
-                        phase = "Testing Ping..."
-                        pingMs = measurePing()
-
-                        phase = "Testing Download..."
-                        val dlResult = measureDownload { live, partial ->
-                            currentMbps = live
-                            if (partial > 0.0) downloadMbps = partial
-                        }
-                        if (dlResult > 0.0) {
-                            downloadMbps = dlResult
-                            currentMbps = dlResult
-                        }
-
-                        phase = "Testing Upload..."
-                        val ulResult = try {
-                            measureUpload { live, partial ->
-                                currentMbps = live
-                                if (partial > 0.0) uploadMbps = partial
-                            }
-                        } catch (_: Exception) {
-                            0.0
-                        }
-                        if (ulResult > 0.0) {
-                            uploadMbps = ulResult
-                        }
-
-                        currentMbps = if (downloadMbps > 0.0) downloadMbps else uploadMbps
-                        phase = if (downloadMbps > 0.0 || uploadMbps > 0.0) "Test Completed" else "No Speed Data"
-                    } catch (e: Exception) {
-                        phase = "Error: ${e.message?.take(28) ?: "Check Internet"}"
-                    } finally {
-                        isTesting = false
-                    }
-                }
-            },
-            enabled = !isTesting,
+            onClick = onStartTest,
+            enabled = !state.isTesting,
             modifier = Modifier.fillMaxWidth().height(54.dp),
             shape = RoundedCornerShape(14.dp),
             colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = BgDark)
         ) {
             Icon(Icons.Default.PlayArrow, contentDescription = null)
             Spacer(Modifier.width(8.dp))
-            Text(if (isTesting) "Testing..." else "START SPEED TEST", fontWeight = FontWeight.Bold)
+            Text(if (state.isTesting) "Testing..." else "START SPEED TEST", fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -170,6 +121,48 @@ private fun SpeedStatCard(title: String, value: String, modifier: Modifier) {
             Spacer(Modifier.height(4.dp))
             Text(value, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
         }
+    }
+}
+
+suspend fun runFullSpeedTest(state: SpeedTestState) {
+    state.isTesting = true
+    state.pingMs = 0L
+    state.downloadMbps = 0.0
+    state.uploadMbps = 0.0
+    state.currentMbps = 0.0
+    try {
+        state.phase = "Testing Ping..."
+        state.pingMs = measurePing()
+
+        state.phase = "Testing Download..."
+        val dlResult = measureDownload { live, partial ->
+            state.currentMbps = live
+            if (partial > 0.0) state.downloadMbps = partial
+        }
+        if (dlResult > 0.0) {
+            state.downloadMbps = dlResult
+            state.currentMbps = dlResult
+        }
+
+        state.phase = "Testing Upload..."
+        val ulResult = try {
+            measureUpload { live, partial ->
+                state.currentMbps = live
+                if (partial > 0.0) state.uploadMbps = partial
+            }
+        } catch (_: Exception) {
+            0.0
+        }
+        if (ulResult > 0.0) {
+            state.uploadMbps = ulResult
+        }
+
+        state.currentMbps = if (state.downloadMbps > 0.0) state.downloadMbps else state.uploadMbps
+        state.phase = if (state.downloadMbps > 0.0 || state.uploadMbps > 0.0) "Test Completed" else "No Speed Data"
+    } catch (e: Exception) {
+        state.phase = "Error: ${e.message?.take(28) ?: "Check Internet"}"
+    } finally {
+        state.isTesting = false
     }
 }
 
@@ -196,10 +189,11 @@ private suspend fun measurePing(): Long = withContext(Dispatchers.IO) {
 
 private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Double) -> Unit): Double =
     withContext(Dispatchers.IO) {
-        val streamCount = 4
-        val durationSec = 9.0
-        val warmupSec = 1.2
-        val maxTotalBytes = 110_000_000L
+        // 6 parallel streams exclusively on nearest Indian Cloudflare edge nodes (no slow EU fallback)
+        val streamCount = 6
+        val durationSec = 9.5
+        val warmupSec = 1.0
+        val maxTotalBytes = 160_000_000L
         val totalBytes = AtomicLong(0L)
         val warmupBytes = AtomicLong(0L)
         val startNano = System.nanoTime()
@@ -208,7 +202,7 @@ private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Doub
 
         val liveJob = async {
             while (active) {
-                delay(180)
+                delay(160)
                 val sec = (System.nanoTime() - startNano) / 1_000_000_000.0
                 if (sec >= warmupSec) {
                     if (!warmupRecorded) {
@@ -218,24 +212,18 @@ private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Doub
                     val postWarmupSec = (sec - warmupSec).coerceAtLeast(0.25)
                     val postWarmupBytes = (totalBytes.get() - warmupBytes.get()).coerceAtLeast(0L)
                     if (postWarmupBytes > 0L) {
-                        val mbps = ((postWarmupBytes * 8.0) / (postWarmupSec * 1_000_000.0)) * 0.94
+                        val mbps = (postWarmupBytes * 8.0) / (postWarmupSec * 1_000_000.0)
                         withContext(Dispatchers.Main) { onLive(mbps, mbps) }
                     }
                 }
             }
         }
 
-        val endpoints = listOf(
-            "https://speed.cloudflare.com/__down?bytes=80000000",
-            "https://proof.ovh.net/files/100Mb.dat"
-        )
-
         val workers = (0 until streamCount).map { idx ->
             async {
-                val baseUrl = endpoints[idx % endpoints.size]
-                val sep = if (baseUrl.contains("?")) "&" else "?"
                 try {
-                    val conn = URL("$baseUrl${sep}s=$idx&r=${System.nanoTime()}").openConnection() as HttpURLConnection
+                    val url = "https://speed.cloudflare.com/__down?bytes=50000000&s=$idx&r=${System.nanoTime()}"
+                    val conn = URL(url).openConnection() as HttpURLConnection
                     conn.connectTimeout = 8000
                     conn.readTimeout = 12000
                     conn.instanceFollowRedirects = true
@@ -245,7 +233,7 @@ private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Doub
                     conn.setRequestProperty("Cache-Control", "no-cache")
                     conn.connect()
                     if (conn.responseCode in 200..299) {
-                        val buf = ByteArray(32768)
+                        val buf = ByteArray(65536)
                         conn.inputStream.use { input ->
                             while (true) {
                                 val elapsed = (System.nanoTime() - startNano) / 1_000_000_000.0
@@ -269,24 +257,24 @@ private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Doub
         val totalSec = (System.nanoTime() - startNano) / 1_000_000_000.0
         val postWarmupSec = (totalSec - warmupSec).coerceAtLeast(0.4)
         val postWarmupBytes = (totalBytes.get() - warmupBytes.get()).coerceAtLeast(totalBytes.get() / 2)
-        if (postWarmupBytes <= 0L) 0.0 else ((postWarmupBytes * 8.0) / (postWarmupSec * 1_000_000.0)) * 0.94
+        if (postWarmupBytes <= 0L) 0.0 else (postWarmupBytes * 8.0) / (postWarmupSec * 1_000_000.0)
     }
 
 private suspend fun measureUpload(onLive: (liveMbps: Double, partialMbps: Double) -> Unit): Double =
     withContext(Dispatchers.IO) {
-        val streamCount = 3
-        val perStreamBytes = 5_000_000
+        val streamCount = 4
+        val perStreamBytes = 6_000_000
         val totalSent = AtomicLong(0L)
         val startNano = System.nanoTime()
         var active = true
 
         val liveJob = async {
             while (active) {
-                delay(180)
+                delay(160)
                 val sec = ((System.nanoTime() - startNano) / 1_000_000_000.0).coerceAtLeast(0.25)
                 val bytes = totalSent.get()
                 if (bytes > 0L) {
-                    val mbps = ((bytes * 8.0) / (sec * 1_000_000.0)) * 0.92
+                    val mbps = (bytes * 8.0) / (sec * 1_000_000.0)
                     withContext(Dispatchers.Main) { onLive(mbps, mbps) }
                 }
             }
@@ -304,12 +292,12 @@ private suspend fun measureUpload(onLive: (liveMbps: Double, partialMbps: Double
                     conn.setRequestProperty("Content-Type", "application/octet-stream")
                     conn.setFixedLengthStreamingMode(perStreamBytes)
 
-                    val chunk = ByteArray(32768) { 0x5A }
+                    val chunk = ByteArray(65536) { 0x5A }
                     var written = 0
                     conn.outputStream.use { out ->
                         while (written < perStreamBytes) {
                             val elapsed = (System.nanoTime() - startNano) / 1_000_000_000.0
-                            if (elapsed >= 6.5) break
+                            if (elapsed >= 7.0) break
                             val step = minOf(chunk.size, perStreamBytes - written)
                             out.write(chunk, 0, step)
                             written += step
@@ -330,5 +318,5 @@ private suspend fun measureUpload(onLive: (liveMbps: Double, partialMbps: Double
 
         val finalSec = ((System.nanoTime() - startNano) / 1_000_000_000.0).coerceAtLeast(0.35)
         val finalBytes = totalSent.get()
-        if (finalBytes <= 0L) 0.0 else ((finalBytes * 8.0) / (finalSec * 1_000_000.0)) * 0.92
+        if (finalBytes <= 0L) 0.0 else (finalBytes * 8.0) / (finalSec * 1_000_000.0)
     }
