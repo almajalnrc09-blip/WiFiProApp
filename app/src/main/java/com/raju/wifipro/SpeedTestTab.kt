@@ -28,6 +28,18 @@ import java.util.concurrent.atomic.AtomicLong
 
 private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"
 
+private val DOWNLOAD_SOURCES = listOf(
+    "https://speed.cloudflare.com/__down?bytes=50000000",
+    "https://ash-speed.hetzner.com/100MB.bin",
+    "https://fsn1-speed.hetzner.com/100MB.bin",
+    "https://nbg1-speed.hetzner.com/100MB.bin"
+)
+
+private val UPLOAD_SOURCES = listOf(
+    "https://speed.cloudflare.com/__up",
+    "https://httpbin.org/post"
+)
+
 @Composable
 fun SpeedTestTab(
     state: SpeedTestState,
@@ -187,13 +199,49 @@ private suspend fun measurePing(): Long = withContext(Dispatchers.IO) {
     if (samples.isEmpty()) 25L else samples.sorted()[samples.size / 2]
 }
 
+private suspend fun downloadFromUrl(
+    baseUrl: String,
+    streamIdx: Int,
+    startNano: Long,
+    durationSec: Double,
+    maxTotalBytes: Long,
+    totalBytes: AtomicLong
+) {
+    try {
+        val sep = if (baseUrl.contains("?")) "&" else "?"
+        val url = "$baseUrl${sep}s=$streamIdx&r=${System.nanoTime()}"
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 8000
+        conn.readTimeout = 12000
+        conn.instanceFollowRedirects = true
+        conn.useCaches = false
+        conn.setRequestProperty("User-Agent", UA)
+        conn.setRequestProperty("Accept", "*/*")
+        conn.setRequestProperty("Cache-Control", "no-cache")
+        conn.connect()
+        if (conn.responseCode in 200..299) {
+            val buf = ByteArray(65536)
+            conn.inputStream.use { input ->
+                while (true) {
+                    val elapsed = (System.nanoTime() - startNano) / 1_000_000_000.0
+                    if (elapsed >= durationSec || totalBytes.get() >= maxTotalBytes) break
+                    val n = input.read(buf)
+                    if (n == -1) break
+                    totalBytes.addAndGet(n.toLong())
+                }
+            }
+        }
+        conn.disconnect()
+    } catch (_: Exception) {
+    }
+}
+
 private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Double) -> Unit): Double =
     withContext(Dispatchers.IO) {
-        // 6 parallel streams exclusively on nearest Indian Cloudflare edge nodes (no slow EU fallback)
         val streamCount = 6
-        val durationSec = 9.5
+        val durationSec = 9.0
         val warmupSec = 1.0
-        val maxTotalBytes = 160_000_000L
+        val maxTotalBytes = 150_000_000L
         val totalBytes = AtomicLong(0L)
         val warmupBytes = AtomicLong(0L)
         val startNano = System.nanoTime()
@@ -221,31 +269,13 @@ private suspend fun measureDownload(onLive: (liveMbps: Double, partialMbps: Doub
 
         val workers = (0 until streamCount).map { idx ->
             async {
-                try {
-                    val url = "https://speed.cloudflare.com/__down?bytes=50000000&s=$idx&r=${System.nanoTime()}"
-                    val conn = URL(url).openConnection() as HttpURLConnection
-                    conn.connectTimeout = 8000
-                    conn.readTimeout = 12000
-                    conn.instanceFollowRedirects = true
-                    conn.useCaches = false
-                    conn.setRequestProperty("User-Agent", UA)
-                    conn.setRequestProperty("Accept", "*/*")
-                    conn.setRequestProperty("Cache-Control", "no-cache")
-                    conn.connect()
-                    if (conn.responseCode in 200..299) {
-                        val buf = ByteArray(65536)
-                        conn.inputStream.use { input ->
-                            while (true) {
-                                val elapsed = (System.nanoTime() - startNano) / 1_000_000_000.0
-                                if (elapsed >= durationSec || totalBytes.get() >= maxTotalBytes) break
-                                val n = input.read(buf)
-                                if (n == -1) break
-                                totalBytes.addAndGet(n.toLong())
-                            }
-                        }
-                    }
-                    conn.disconnect()
-                } catch (_: Exception) {
+                val primaryUrl = DOWNLOAD_SOURCES[idx % DOWNLOAD_SOURCES.size]
+                downloadFromUrl(primaryUrl, idx, startNano, durationSec, maxTotalBytes, totalBytes)
+                // If primary stream yielded very little data early on, try fallback source
+                val elapsed = (System.nanoTime() - startNano) / 1_000_000_000.0
+                if (elapsed < durationSec - 1.5 && totalBytes.get() < 5_000_000L) {
+                    val fallbackUrl = DOWNLOAD_SOURCES[(idx + 1) % DOWNLOAD_SOURCES.size]
+                    downloadFromUrl(fallbackUrl, idx + 10, startNano, durationSec, maxTotalBytes, totalBytes)
                 }
             }
         }
@@ -280,10 +310,11 @@ private suspend fun measureUpload(onLive: (liveMbps: Double, partialMbps: Double
             }
         }
 
-        val workers = (0 until streamCount).map {
+        val workers = (0 until streamCount).map { idx ->
             async {
+                val targetUrl = UPLOAD_SOURCES[idx % UPLOAD_SOURCES.size]
                 try {
-                    val conn = URL("https://speed.cloudflare.com/__up").openConnection() as HttpURLConnection
+                    val conn = URL(targetUrl).openConnection() as HttpURLConnection
                     conn.connectTimeout = 8000
                     conn.readTimeout = 12000
                     conn.requestMethod = "POST"
