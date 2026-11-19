@@ -2,26 +2,19 @@ package com.raju.wifipro
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import android.net.http.SslError
 import android.net.wifi.WifiManager
 import android.webkit.CookieManager
-import android.webkit.RenderProcessGoneDetail
-import android.webkit.SafeBrowsingResponse
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -35,76 +28,20 @@ import androidx.compose.ui.viewinterop.AndroidView
 import org.json.JSONObject
 import java.net.Inet4Address
 
-private data class RouterSlot(
-    val key: String,
-    val title: String,
-    val gateway: String,
-    val username: String,
-    val password: String
-)
-
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun RouterTab() {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("router_main_sub_v1", Context.MODE_PRIVATE) }
-    val detectedGateway = remember { detectGatewayIp(context) }
+    val prefs = remember { context.getSharedPreferences("router_default_vault", Context.MODE_PRIVATE) }
+    val gatewayIp = remember { detectGatewayIp(context) }
 
-    fun loadSlots(): List<RouterSlot> {
-        val mainRaw = prefs.getString("main_router", null)?.let { JSONObject(it) }
-        val subRaw = prefs.getString("sub_router", null)?.let { JSONObject(it) }
-
-        val mainGw = mainRaw?.optString("gateway", "")?.ifBlank { detectedGateway } ?: detectedGateway
-        val subGw = subRaw?.optString("gateway", "")?.ifBlank { "192.168.8.2" } ?: "192.168.8.2"
-
-        return listOf(
-            RouterSlot(
-                key = "main_router",
-                title = "Main Router",
-                gateway = mainGw,
-                username = mainRaw?.optString("user", "admin") ?: "admin",
-                password = mainRaw?.optString("pass", "") ?: ""
-            ),
-            RouterSlot(
-                key = "sub_router",
-                title = "Sub Router",
-                gateway = subGw,
-                username = subRaw?.optString("user", "admin") ?: "admin",
-                password = subRaw?.optString("pass", "") ?: ""
-            )
-        )
+    val savedJson = remember(gatewayIp) {
+        prefs.getString(gatewayIp, null)?.let { JSONObject(it) }
     }
-
-    var slots by remember { mutableStateOf(loadSlots()) }
-    var selectedIdx by remember { mutableIntStateOf(0) }
-    var urlText by remember { mutableStateOf("http://$detectedGateway") }
-    var isPageLoading by remember { mutableStateOf(false) }
-    var pageErrorText by remember { mutableStateOf<String?>(null) }
+    var username by remember(savedJson) { mutableStateOf(savedJson?.optString("user", "admin") ?: "admin") }
+    var password by remember(savedJson) { mutableStateOf(savedJson?.optString("pass", "") ?: "") }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var showVaultDialog by remember { mutableStateOf(false) }
-
-    var pendingUser by remember { mutableStateOf<String?>(null) }
-    var pendingPass by remember { mutableStateOf<String?>(null) }
-
-    val activeSlot = slots[selectedIdx]
-    var editGateway by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeSlot.gateway) }
-    var editUser by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeSlot.username) }
-    var editPass by remember(selectedIdx, showVaultDialog) { mutableStateOf(activeSlot.password) }
-
-    fun saveCurrentSlot(): RouterSlot {
-        val cleanGw = editGateway.trim()
-            .removePrefix("http://")
-            .removePrefix("https://")
-            .ifBlank { detectedGateway }
-        val obj = JSONObject()
-            .put("gateway", cleanGw)
-            .put("user", editUser)
-            .put("pass", editPass)
-        prefs.edit().putString(activeSlot.key, obj.toString()).apply()
-        val updated = RouterSlot(activeSlot.key, activeSlot.title, cleanGw, editUser, editPass)
-        slots = slots.mapIndexed { idx, item -> if (idx == selectedIdx) updated else item }
-        return updated
-    }
 
     fun runAutoFillAndLogin(view: WebView?, user: String, pass: String) {
         if (view == null || pass.isEmpty()) return
@@ -187,206 +124,51 @@ fun RouterTab() {
                 if (userEl && $safeUser.length > 0) setNativeValue(userEl, $safeUser);
                 if (passEl) {
                     setNativeValue(passEl, $safePass);
-                    setTimeout(function() { clickLoginButton(passEl); }, 350);
-                    setTimeout(function() { clickLoginButton(passEl); }, 1000);
+                    setTimeout(function() { clickLoginButton(passEl); }, 300);
+                    setTimeout(function() { clickLoginButton(passEl); }, 900);
                 }
             })();
         """.trimIndent()
         view.evaluateJavascript(js, null)
     }
 
-    fun navigateToUrl(rawHost: String, autoUser: String? = null, autoPass: String? = null) {
-        val clean = rawHost.trim()
-        val target = if (clean.startsWith("http://") || clean.startsWith("https://")) clean else "http://$clean"
-        urlText = target
-        pageErrorText = null
-        pendingUser = autoUser
-        pendingPass = autoPass
-        webViewRef?.stopLoading()
-        webViewRef?.loadUrl(target)
-    }
-
     Box(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                IconButton(onClick = { webViewRef?.goBack() }, modifier = Modifier.size(38.dp)) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = TextPrimary)
-                }
-                OutlinedTextField(
-                    value = urlText,
-                    onValueChange = { urlText = it },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                    textStyle = LocalTextStyle.current.copy(fontSize = 14.sp, color = TextPrimary),
-                    shape = RoundedCornerShape(10.dp)
-                )
-                IconButton(
-                    onClick = { navigateToUrl(urlText) },
-                    modifier = Modifier.size(38.dp)
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Go / Reload", tint = AccentCyan)
-                }
-            }
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                WebView(ctx).apply {
+                    CookieManager.getInstance().setAcceptCookie(true)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
-            if (isPageLoading) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(3.dp), color = AccentCyan)
-            }
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    settings.databaseEnabled = true
+                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    settings.loadWithOverviewMode = true
+                    settings.useWideViewPort = true
+                    settings.builtInZoomControls = true
+                    settings.displayZoomControls = false
 
-            if (pageErrorText != null) {
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
-                    colors = CardDefaults.cardColors(containerColor = CardDark)
-                ) {
-                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(
-                            text = pageErrorText ?: "",
-                            color = AccentAmber,
-                            fontSize = 12.sp
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            TextButton(
-                                onClick = {
-                                    val hostOnly = urlText.removePrefix("http://").removePrefix("https://").substringBefore("/")
-                                    navigateToUrl("https://$hostOnly")
-                                },
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
-                            ) {
-                                Text("Try HTTPS", color = AccentCyan, fontSize = 12.sp)
-                            }
-                            TextButton(
-                                onClick = {
-                                    val hostOnly = urlText.removePrefix("http://").removePrefix("https://").substringBefore("/")
-                                    navigateToUrl("http://$hostOnly")
-                                },
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
-                            ) {
-                                Text("Try Root HTTP", color = AccentGreen, fontSize = 12.sp)
-                            }
+                    webViewClient = object : WebViewClient() {
+                        @SuppressLint("WebViewClientOnReceivedSslError")
+                        override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                            handler?.proceed()
                         }
                     }
+                    webChromeClient = WebChromeClient()
+                    loadUrl("http://$gatewayIp")
+                    webViewRef = this
                 }
             }
-
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    WebView(ctx).apply {
-                        CookieManager.getInstance().setAcceptCookie(true)
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        settings.databaseEnabled = true
-                        settings.javaScriptCanOpenWindowsAutomatically = true
-                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                        settings.cacheMode = WebSettings.LOAD_NO_CACHE
-                        settings.loadWithOverviewMode = true
-                        settings.useWideViewPort = true
-                        settings.builtInZoomControls = true
-                        settings.displayZoomControls = false
-                        settings.userAgentString =
-                            "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                                val nextUrl = request?.url?.toString()
-                                if (!nextUrl.isNullOrBlank()) {
-                                    urlText = nextUrl
-                                }
-                                return false
-                            }
-
-                            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                                super.onPageStarted(view, url, favicon)
-                                isPageLoading = true
-                                pageErrorText = null
-                                if (!url.isNullOrBlank()) urlText = url
-                            }
-
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                super.onPageFinished(view, url)
-                                isPageLoading = false
-                                if (!url.isNullOrBlank()) urlText = url
-                                // Check if page rendered blank body after load
-                                view?.evaluateJavascript(
-                                    "(function(){ return document.body ? document.body.innerText.trim().length : 0; })()"
-                                ) { lenStr ->
-                                    val textLen = lenStr?.trim()?.toIntOrNull() ?: -1
-                                    if (textLen == 0) {
-                                        pageErrorText = "Router page loaded empty/blank on $url (TP-Link web UI may require Chrome/AP reachability)."
-                                    }
-                                }
-                                val u = pendingUser
-                                val p = pendingPass
-                                if (!p.isNullOrEmpty()) {
-                                    runAutoFillAndLogin(view, u ?: "admin", p)
-                                    view?.postDelayed({ runAutoFillAndLogin(view, u ?: "admin", p) }, 1200)
-                                    view?.postDelayed({ runAutoFillAndLogin(view, u ?: "admin", p) }, 2400)
-                                    pendingUser = null
-                                    pendingPass = null
-                                }
-                            }
-
-                            @SuppressLint("WebViewClientOnReceivedSslError")
-                            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                                handler?.proceed()
-                            }
-
-                            override fun onSafeBrowsingHit(
-                                view: WebView?,
-                                request: WebResourceRequest?,
-                                threatType: Int,
-                                callback: SafeBrowsingResponse?
-                            ) {
-                                callback?.proceed(true)
-                            }
-
-                            override fun onReceivedError(
-                                view: WebView?,
-                                request: WebResourceRequest?,
-                                error: WebResourceError?
-                            ) {
-                                if (request?.isForMainFrame == true) {
-                                    val failedUrl = request.url?.toString() ?: ""
-                                    if (failedUrl.startsWith("http://")) {
-                                        val httpsUrl = failedUrl.replaceFirst("http://", "https://")
-                                        urlText = httpsUrl
-                                        view?.loadUrl(httpsUrl)
-                                        return
-                                    }
-                                    isPageLoading = false
-                                    pageErrorText = "Load issue on $failedUrl (${error?.description ?: "Connection failed"})"
-                                }
-                            }
-
-                            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
-                                isPageLoading = false
-                                pageErrorText = "WebView renderer stopped. Tap Try HTTPS or Reload."
-                                return true
-                            }
-                        }
-                        webChromeClient = WebChromeClient()
-                        loadUrl(urlText)
-                        webViewRef = this
-                    }
-                }
-            )
-        }
+        )
 
         FloatingActionButton(
-            onClick = {
-                slots = loadSlots()
-                showVaultDialog = true
-            },
+            onClick = { showVaultDialog = true },
             containerColor = AccentCyan,
             contentColor = BgDark,
             modifier = Modifier.align(Alignment.BottomEnd).padding(18.dp)
         ) {
-            Icon(Icons.Default.Key, contentDescription = "Main & Sub Router Vault")
+            Icon(Icons.Default.Key, contentDescription = "Router Login Vault")
         }
     }
 
@@ -399,45 +181,33 @@ fun RouterTab() {
             },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        slots.forEachIndexed { idx, slot ->
-                            FilterChip(
-                                selected = selectedIdx == idx,
-                                onClick = {
-                                    saveCurrentSlot()
-                                    selectedIdx = idx
-                                },
-                                label = { Text(slot.title, fontWeight = FontWeight.SemiBold) },
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-                    }
-
                     OutlinedTextField(
-                        value = editGateway,
-                        onValueChange = { editGateway = it },
-                        label = { Text("Gateway IP / Address") },
+                        value = gatewayIp,
+                        onValueChange = {},
+                        readOnly = true,
+                        enabled = false,
+                        label = { Text("Default Gateway IP") },
                         singleLine = true,
+                        shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth()
                     )
 
                     OutlinedTextField(
-                        value = editUser,
-                        onValueChange = { editUser = it },
+                        value = username,
+                        onValueChange = { username = it },
                         label = { Text("Username (if needed)") },
                         singleLine = true,
+                        shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth()
                     )
 
                     OutlinedTextField(
-                        value = editPass,
-                        onValueChange = { editPass = it },
+                        value = password,
+                        onValueChange = { password = it },
                         label = { Text("Password") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
+                        shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
@@ -445,18 +215,12 @@ fun RouterTab() {
             confirmButton = {
                 Button(
                     onClick = {
-                        val saved = saveCurrentSlot()
+                        val obj = JSONObject()
+                            .put("user", username)
+                            .put("pass", password)
+                        prefs.edit().putString(gatewayIp, obj.toString()).apply()
                         showVaultDialog = false
-                        val targetHost = saved.gateway
-                        val currentHost = urlText
-                            .removePrefix("http://")
-                            .removePrefix("https://")
-                            .substringBefore("/")
-                        if (currentHost == targetHost) {
-                            runAutoFillAndLogin(webViewRef, saved.username, saved.password)
-                        } else {
-                            navigateToUrl(targetHost, saved.username, saved.password)
-                        }
+                        runAutoFillAndLogin(webViewRef, username, password)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AccentCyan, contentColor = BgDark)
                 ) {
@@ -464,16 +228,8 @@ fun RouterTab() {
                 }
             },
             dismissButton = {
-                Row {
-                    TextButton(onClick = {
-                        saveCurrentSlot()
-                        showVaultDialog = false
-                    }) {
-                        Text("Save Only", color = AccentGreen)
-                    }
-                    TextButton(onClick = { showVaultDialog = false }) {
-                        Text("Close", color = TextSecondary)
-                    }
+                TextButton(onClick = { showVaultDialog = false }) {
+                    Text("Close", color = TextSecondary)
                 }
             }
         )
