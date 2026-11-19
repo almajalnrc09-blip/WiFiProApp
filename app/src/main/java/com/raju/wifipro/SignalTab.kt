@@ -46,6 +46,7 @@ fun SignalTab() {
     val wifiManager = remember { context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager }
 
     var ssid by remember { mutableStateOf("Not Connected") }
+    var bssid by remember { mutableStateOf("") }
     var rssi by remember { mutableIntStateOf(-100) }
     var freq by remember { mutableIntStateOf(0) }
     var linkSpeed by remember { mutableIntStateOf(0) }
@@ -62,10 +63,9 @@ fun SignalTab() {
         results.forEach { sr ->
             val key = sr.BSSID ?: "${sr.SSID}_${sr.frequency}"
             val name = if (sr.SSID.isNullOrBlank()) "<Hidden>" else sr.SSID
-            recentMap[key] = CachedNet(name, key, sr.frequency, sr.level, now)
+            recentMap[key] = CachedNet(name, sr.BSSID ?: "", sr.frequency, sr.level, now)
         }
-        // Keep networks seen within last 25 seconds so momentary scan misses don't flicker
-        val staleKeys = recentMap.filterValues { now - it.seenAtMs > 25_000L }.keys
+        val staleKeys = recentMap.filterValues { now - it.seenAtMs > 20_000L }.keys
         staleKeys.forEach { recentMap.remove(it) }
         netList = recentMap.values.toList()
     }
@@ -111,6 +111,7 @@ fun SignalTab() {
             val info = wifiManager.connectionInfo
             if (info != null && info.networkId != -1) {
                 ssid = info.ssid?.removeSurrounding("\"") ?: "Connected Wi-Fi"
+                bssid = info.bssid ?: ""
                 rssi = info.rssi
                 freq = info.frequency
                 linkSpeed = info.linkSpeed
@@ -202,14 +203,18 @@ fun SignalTab() {
             title = "5 GHz Channel Map",
             is5G = true,
             netList = netList,
-            currentSsid = ssid
+            currentSsid = ssid,
+            currentBssid = bssid,
+            currentFreq = freq
         )
 
         ChannelMapCard(
             title = "2.4 GHz Channel Map (Ch 1-11)",
             is5G = false,
             netList = netList,
-            currentSsid = ssid
+            currentSsid = ssid,
+            currentBssid = bssid,
+            currentFreq = freq
         )
 
         Card(colors = CardDefaults.cardColors(containerColor = CardDark), shape = RoundedCornerShape(16.dp)) {
@@ -238,12 +243,23 @@ fun SignalTab() {
     }
 }
 
+private fun isConnectedMatch(net: CachedNet, currentSsid: String, currentBssid: String, currentFreq: Int): Boolean {
+    if (currentFreq <= 0) return false
+    val netIs5G = net.freq in 5000..5900
+    val curIs5G = currentFreq in 5000..5900
+    if (netIs5G != curIs5G) return false
+    if (currentBssid.isNotBlank() && net.bssid.equals(currentBssid, ignoreCase = true)) return true
+    return net.ssid == currentSsid && net.freq == currentFreq
+}
+
 @Composable
 private fun ChannelMapCard(
     title: String,
     is5G: Boolean,
     netList: List<CachedNet>,
-    currentSsid: String
+    currentSsid: String,
+    currentBssid: String,
+    currentFreq: Int
 ) {
     val filtered = netList.filter {
         if (is5G) it.freq in 5000..5900 else it.freq in 2400..2500
@@ -264,7 +280,7 @@ private fun ChannelMapCard(
                 filtered.sortedByDescending { it.level }.take(12).forEachIndexed { idx, net ->
                     val ch = freqToChannel(net.freq)
                     val centerFrac = if (!is5G) {
-                        ((ch.coerceIn(1, 13) - 1) / 11f).coerceIn(0.05f, 0.95f)
+                        ((ch.coerceIn(1, 11) - 1) / 10f).coerceIn(0.05f, 0.95f)
                     } else {
                         val pos = channels5G.indexOf(ch).let { if (it >= 0) it else 0 }
                         ((pos + 1).toFloat() / (channels5G.size + 1)).coerceIn(0.05f, 0.95f)
@@ -273,7 +289,7 @@ private fun ChannelMapCard(
                     val spread = if (!is5G) w * 0.14f else w * 0.06f
                     val peakNorm = ((net.level.coerceIn(-100, -30) + 100) / 70f)
                     val peakY = h - (peakNorm * (h - 14f))
-                    val isCurrent = net.ssid == currentSsid
+                    val isCurrent = isConnectedMatch(net, currentSsid, currentBssid, currentFreq)
                     val color = if (isCurrent) AccentGreen else palette[idx % palette.size]
 
                     val p = Path().apply {
@@ -296,7 +312,7 @@ private fun ChannelMapCard(
             } else {
                 filtered.sortedByDescending { it.level }.take(8).forEach { net ->
                     val ch = freqToChannel(net.freq)
-                    val isMine = net.ssid == currentSsid
+                    val isMine = isConnectedMatch(net, currentSsid, currentBssid, currentFreq)
                     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(
                             text = net.ssid + if (isMine) " (Connected)" else "",
